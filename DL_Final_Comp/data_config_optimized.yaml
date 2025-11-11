@@ -1,0 +1,12 @@
+dataset_name: "tsbpp/fall2025_deeplearning"
+image_size: 96
+num_workers: 16  # Increased for faster data loading (try 16-32)
+pin_memory: true
+persistent_workers: true  # Keep workers alive between epochs
+prefetch_factor: 4  # Increased prefetch for better GPU utilization
+
+# Multi-crop settings - Reduced
+global_crops_scale: [0.4, 1.0]
+local_crops_scale: [0.05, 0.4]
+local_crops_number: 2  # Reduced from 8 (2 global + 2 local = 4 total)
+

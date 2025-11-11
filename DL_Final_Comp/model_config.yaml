@@ -1,0 +1,6 @@
+model_name: "vit_small_patch16_224"  # or "vit_base_patch16_224"
+img_size: 96
+patch_size: 16
+drop_path_rate: 0.1
+use_cls_token: true  # true for CLS token, false for mean-pool
+

@@ -1,0 +1,31 @@
+# Optimized Training Config - Fast training with minimal performance loss
+batch_size: 128  # Increased for better GPU utilization
+num_epochs: 75  # Reduced from 200 (70-80 range)
+learning_rate: 0.0005
+weight_decay: 0.04
+warmup_epochs: 5  # Reduced from 10
+min_lr: 1e-6
+
+# DINO specific - Reduced projection head
+out_dim: 32768  # Reduced from 65536
+teacher_temp: 0.04
+student_temp: 0.1
+warmup_teacher_temp: 0.04
+warmup_teacher_temp_epochs: 30
+momentum_teacher_base: 0.996
+momentum_teacher_final: 1.0
+
+# Multi-crop
+global_crops_scale: [0.4, 1.0]
+local_crops_scale: [0.05, 0.4]
+
+# Checkpointing
+checkpoint_dir: "./checkpoints"
+save_freq: 10  # Save every N epochs
+
+# Performance optimizations
+use_torch_compile: false  # Set to true for speed, but first compile takes 5-10 min
+use_channels_last: true
+use_fused_adamw: true
+use_tf32: true
+

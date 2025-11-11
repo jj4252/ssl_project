@@ -1,0 +1,10 @@
+# Evaluation config
+use_cls_token: true  # Should match training
+k_values: [10, 20, 50]
+batch_size: 128
+num_workers: 4
+
+# Linear probe (optional)
+linear_probe: false
+linear_probe_C: 1.0
+
