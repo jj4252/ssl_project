@@ -1,0 +1,27 @@
+# Knowledge Distillation Training Config
+# Trains a lightweight student to mimic a frozen teacher
+
+# Training hyperparameters
+batch_size: 64
+num_epochs: 100  # Reduced from 200 for faster convergence
+learning_rate: 0.0005  # 5e-4
+weight_decay: 0.04
+warmup_epochs: 10
+min_lr: 1e-6
+
+# Distillation loss weights
+distill_loss_weights:
+  cls: 1.0      # CLS token loss weight
+  patch: 0.5    # Patch token loss weight
+
+# Data augmentation
+use_multi_crop: false  # Set to true to use multi-crop (slower but potentially better)
+
+# Optimization settings
+use_torch_compile: true   # Compile model for faster training
+use_fused_adamw: true     # Use fused AdamW optimizer
+
+# Checkpointing
+checkpoint_dir: "/scratch/$USER/DL_V2/checkpoints"  # Update with your path
+save_freq: 10  # Save checkpoint every N epochs
+
