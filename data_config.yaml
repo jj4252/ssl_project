@@ -1,0 +1,9 @@
+# Data loading configuration (optimized for speed)
+
+dataset_name: "tsbpp/fall2025_deeplearning"
+image_size: 224  # Match student image size
+num_workers: 4  # Optimized for Slurm
+persistent_workers: false  # Must be false
+prefetch_factor: 2
+pin_memory: true
+

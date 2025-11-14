@@ -1,0 +1,41 @@
+# Optimized Knowledge Distillation Training Config
+# Designed for fast training: 20-40 minutes per epoch on A100/L4
+
+# Training hyperparameters
+batch_size: 64
+num_epochs: 100
+learning_rate: 0.0005  # 5e-4
+weight_decay: 0.04
+warmup_epochs: 10
+min_lr: 1e-6
+
+# Step-capped training (major speedup)
+max_steps_per_epoch: 500  # Process only 500 batches per epoch
+
+# Distillation loss weights
+distill_loss_weights:
+  cls: 1.0      # CLS token loss weight
+  patch: 0.5    # Patch token loss weight
+
+# Data augmentation (simplified for speed)
+use_multi_crop: false  # Use simple single-crop transform
+use_local_crops: false  # Disable local crops (major speedup)
+
+# Teacher feature caching (optional, major speedup)
+cache_teacher_features: false  # Set to true to cache teacher features
+teacher_feature_dir: "/scratch/$USER/ssl_project/cache/features"
+
+# Optimization settings
+compile_student: true   # Compile only student (never compile teacher)
+use_fused_adamw: true   # Use fused AdamW optimizer
+
+# DataLoader settings (optimized for Slurm)
+num_workers: 4
+persistent_workers: false  # Must be false to avoid KeyError
+prefetch_factor: 2
+pin_memory: true
+
+# Checkpointing
+checkpoint_dir: "/scratch/$USER/ssl_project/DL_Final_Comp/checkpoints"
+save_every: 100  # Save checkpoint every N steps (0 = only at end of epoch)
+
