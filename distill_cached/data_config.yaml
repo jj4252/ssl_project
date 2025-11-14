@@ -1,0 +1,14 @@
+# Data loading configuration (optimized for speed)
+
+dataset_name: "tsbpp/fall2025_deeplearning"
+image_size: 224  # Match student image size
+num_workers: 4  # Optimized for Slurm
+persistent_workers: false  # Must be false
+prefetch_factor: 2
+pin_memory: true
+
+# Cache configuration (2-stage pipeline)
+use_cached: false  # Set to true to use cached tensors instead of HF/raw images
+cache_dir: "/scratch/jj4252/Nov_14_distill/cache_images"  # Directory for cached tensors
+cache_shard_size: 10000  # Number of samples per shard file
+
