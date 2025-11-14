@@ -40,15 +40,25 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
         train_config: Optional training config (for compatibility)
         batch_size: Batch size for processing (default: 256)
     """
-    # Get cache configuration
-    cache_dir = data_config.get('cache_dir', './cache_images')
-    cache_dir = os.path.expandvars(cache_dir)
+    # Get cache configuration (new settings take precedence)
+    cache_root = data_config.get('cache_root', data_config.get('cache_dir', './cache_images'))
+    cache_root = os.path.expandvars(cache_root)
+    cache_image_size = data_config.get('cache_image_size', 256)
+    cache_dtype = data_config.get('cache_dtype', 'float32')
     cache_shard_size = data_config.get('cache_shard_size', 10000)
     
+    # Convert dtype string to torch dtype
+    if cache_dtype == 'float16':
+        torch_dtype = torch.float16
+    else:
+        torch_dtype = torch.float32
+    
     # Create cache directory
-    cache_path = Path(cache_dir)
+    cache_path = Path(cache_root)
     cache_path.mkdir(parents=True, exist_ok=True)
-    print(f"Cache directory: {cache_dir}")
+    print(f"Cache root: {cache_root}")
+    print(f"Cache image size: {cache_image_size}x{cache_image_size}")
+    print(f"Cache dtype: {cache_dtype}")
     print(f"Shard size: {cache_shard_size} samples per shard")
     
     # Build dataset for precomputing
@@ -144,6 +154,13 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
             if len(shard_buffer) >= cache_shard_size:
                 # Write shard
                 shard_tensor = torch.stack(shard_buffer, dim=0)  # [N, 3, H, W]
+                
+                # Convert to specified dtype
+                if torch_dtype == torch.float16:
+                    shard_tensor = shard_tensor.half()
+                else:
+                    shard_tensor = shard_tensor.float()
+                
                 shard_path = f"images_shard_{shard_idx:05d}.pt"
                 shard_file = cache_path / shard_path
                 
@@ -152,7 +169,7 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
                     print(f"  ⚠️  Shard {shard_idx} already exists, skipping write")
                 else:
                     torch.save(
-                        {"images": shard_tensor},
+                        {"images": shard_tensor, "indices": list(range(global_idx - len(shard_buffer), global_idx))},
                         shard_file
                     )
                 
@@ -186,6 +203,13 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
     # Write final shard if there are leftover samples
     if len(shard_buffer) > 0:
         shard_tensor = torch.stack(shard_buffer, dim=0)
+        
+        # Convert to specified dtype
+        if torch_dtype == torch.float16:
+            shard_tensor = shard_tensor.half()
+        else:
+            shard_tensor = shard_tensor.float()
+        
         shard_path = f"images_shard_{shard_idx:05d}.pt"
         shard_file = cache_path / shard_path
         
@@ -194,7 +218,7 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
             print(f"  ⚠️  Final shard {shard_idx} already exists, skipping write")
         else:
             torch.save(
-                {"images": shard_tensor},
+                {"images": shard_tensor, "indices": list(range(global_idx - len(shard_buffer), global_idx))},
                 shard_file
             )
         
@@ -208,10 +232,17 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
         print(f"  ✓ Wrote final shard {shard_idx}: {len(shard_buffer)} samples")
         shard_idx += 1
     
-    # Final index update
+    # Final index update with metadata
     index = {
         "num_samples": total_samples,
-        "shards": index_entries
+        "shards": index_entries,
+        "cache_image_size": cache_image_size,
+        "cache_dtype": cache_dtype,
+        "cache_shard_size": cache_shard_size,
+        "config_snapshot": {
+            "dataset_name": data_config.get('dataset_name', 'unknown'),
+            "image_size": data_config.get('image_size', 224),
+        }
     }
     
     with open(index_file, 'w') as f:
@@ -224,7 +255,7 @@ def precompute_cache(data_config: dict, train_config: dict = None, batch_size: i
         print(f"  Total samples: {total_samples:,}")
         print(f"  Total shards: {len(index_entries)}")
         print(f"  Index file: {index_file}")
-        print(f"\n  To use cached data, set use_cached: true in data_config.yaml")
+        print(f"\n  To use cached data, set use_cached_tensors: true in data_config.yaml")
     else:
         print(f"\n⚠️  Cache precomputation incomplete!")
         print(f"  Expected: {total_samples:,} samples")

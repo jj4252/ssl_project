@@ -110,13 +110,14 @@ class CachedTensorDataset(Dataset):
     Dataset that loads preprocessed tensors from cached shard files.
     
     This dataset reads from shard files created by precompute_cache.py.
-    Each shard contains a tensor of shape [N, 3, H, W] and is loaded lazily.
+    Each shard contains unnormalized tensors [N, 3, H, W] in range [0, 1].
+    The transform should normalize and apply augmentations.
     """
     def __init__(self, cache_dir: str, transform=None):
         """
         Args:
             cache_dir: Directory containing cached shard files and index.json
-            transform: Optional transform to apply to each image tensor
+            transform: Transform to apply to each image tensor (should normalize + augment)
         """
         self.cache_dir = Path(cache_dir)
         self.transform = transform
@@ -134,16 +135,20 @@ class CachedTensorDataset(Dataset):
         
         self.num_samples = index["num_samples"]
         self.shards = index["shards"]
+        self.cache_image_size = index.get("cache_image_size", 256)
+        self.cache_dtype = index.get("cache_dtype", "float32")
         
         # Build prefix sum for efficient idx -> shard mapping
         self.shard_prefix_sum = [0]
         for shard in self.shards:
             self.shard_prefix_sum.append(self.shard_prefix_sum[-1] + shard["num_samples"])
         
-        # In-memory cache for loaded shards
+        # In-memory cache for loaded shards (per-epoch caching)
         self._shard_cache: Dict[str, torch.Tensor] = {}
         
         print(f"✓ Loaded cached dataset: {self.num_samples} samples in {len(self.shards)} shards")
+        print(f"  Cache image size: {self.cache_image_size}x{self.cache_image_size}")
+        print(f"  Cache dtype: {self.cache_dtype}")
     
     def _load_shard(self, shard_path: str) -> torch.Tensor:
         """
@@ -190,13 +195,13 @@ class CachedTensorDataset(Dataset):
     
     def __getitem__(self, idx: int) -> torch.Tensor:
         """
-        Get a single image tensor.
+        Get a single image tensor with augmentations applied.
         
         Args:
             idx: Global sample index
         
         Returns:
-            Tensor of shape [3, H, W] (or transformed version)
+            Tensor of shape [3, H, W] (normalized and augmented)
         """
         if idx < 0 or idx >= self.num_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.num_samples})")
@@ -208,14 +213,22 @@ class CachedTensorDataset(Dataset):
         # Load shard (cached in memory)
         shard_tensor = self._load_shard(shard_info["shard_path"])
         
-        # Extract the specific image
-        img = shard_tensor[local_idx]  # [3, H, W]
+        # Extract the specific image (unnormalized, [0, 1])
+        img = shard_tensor[local_idx].clone()  # [3, H, W], range [0, 1]
         
-        # Apply transform if provided
+        # Convert to float32 if needed
+        if img.dtype != torch.float32:
+            img = img.float()
+        
+        # Apply transform (should normalize + apply augmentations)
         if self.transform is not None:
             img = self.transform(img)
         
         return img
+    
+    def clear_shard_cache(self):
+        """Clear shard cache (useful for memory management)"""
+        self._shard_cache.clear()
     
     def __len__(self) -> int:
         return self.num_samples
@@ -228,21 +241,22 @@ def build_precompute_dataset(data_config: dict) -> Dataset:
     This returns a dataset that applies deterministic preprocessing to images
     for caching purposes. It does not include stochastic augmentations.
     
+    Stage 1: Decode + resize only (no normalization, no augmentations)
+    Normalization will be applied during Stage 2 (training) along with augmentations.
+    
     Args:
         data_config: Data configuration dictionary
     
     Returns:
-        Dataset that returns preprocessed tensors [3, H, W]
+        Dataset that returns preprocessed tensors [3, H, W] (unnormalized, [0, 1])
     """
-    image_size = data_config.get('image_size', 224)
+    cache_image_size = data_config.get('cache_image_size', 256)
     
-    # Deterministic preprocessing: resize, center crop, normalize
-    # No stochastic augmentations (those will be applied during training)
+    # Deterministic preprocessing: resize only (no normalization, no augmentations)
+    # We store unnormalized tensors [0, 1] so we can apply augmentations later
     precompute_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
+        transforms.Resize((cache_image_size, cache_image_size), interpolation=InterpolationMode.BICUBIC),
+        transforms.ToTensor(),  # Converts to [0, 1] range, no normalization
     ])
     
     dataset = PretrainDataset(transform=precompute_transform)
@@ -261,35 +275,56 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         DataLoader for pretraining
     """
     from transforms import SimpleTransform, FastMultiCropTransform
+    from tensor_augmentations import TensorSimpleTransform, TensorMultiCropTransform
     
-    use_cached = data_config.get('use_cached', False)
+    # Check for cached mode (new setting takes precedence)
+    use_cached_tensors = data_config.get('use_cached_tensors', data_config.get('use_cached', None))
     
-    if use_cached:
-        # Cached mode: load from preprocessed tensor shards
-        cache_dir = data_config.get('cache_dir', './cache_images')
-        cache_dir = os.path.expandvars(cache_dir)
+    # Auto-detect cache if not explicitly set
+    if use_cached_tensors is None:
+        cache_root = data_config.get('cache_root', data_config.get('cache_dir', './cache_images'))
+        cache_root = os.path.expandvars(cache_root)
+        index_path = os.path.join(cache_root, 'index.json')
+        if os.path.exists(index_path):
+            print(f"✓ Auto-detected cache at {cache_root}, enabling cached tensor mode")
+            use_cached_tensors = True
+        else:
+            use_cached_tensors = False
+    elif use_cached_tensors is False:
+        # Explicitly disabled
+        use_cached_tensors = False
+    else:
+        # Explicitly enabled
+        use_cached_tensors = True
+    
+    if use_cached_tensors:
+        # Cached mode: load from preprocessed tensor shards and apply full augmentations
+        cache_root = data_config.get('cache_root', data_config.get('cache_dir', './cache_images'))
+        cache_root = os.path.expandvars(cache_root)
         
-        # For cached mode, cached tensors are already normalized [3, H, W]
-        # We apply minimal augmentations that work on tensors
-        # Note: Most augmentations (crop, resize) are already done during caching
-        # We only apply simple augmentations like random flip
-        import random
-        from torchvision.transforms import functional as F_torch
+        # Get training image size
+        image_size = data_config.get('image_size', 224)
+        use_multi_crop = train_config.get('use_multi_crop', False)
+        use_local_crops = train_config.get('use_local_crops', False)
         
-        class TensorAugmentation:
-            """Light augmentation for preprocessed normalized tensors"""
-            def __init__(self):
-                pass
-            
-            def __call__(self, img):
-                # Random horizontal flip (works on tensors)
-                if random.random() < 0.5:
-                    img = torch.flip(img, dims=[2])  # Flip width dimension
-                return img
+        # Create tensor-based augmentations (work on unnormalized tensors [0, 1])
+        if use_multi_crop:
+            transform = TensorMultiCropTransform(
+                global_crops_scale=tuple(data_config.get('global_crops_scale', [0.4, 1.0])),
+                local_crops_scale=tuple(data_config.get('local_crops_scale', [0.05, 0.4])),
+                local_crops_number=data_config.get('local_crops_number', 0),
+                image_size=image_size,
+                use_local_crops=use_local_crops
+            )
+        else:
+            transform = TensorSimpleTransform(
+                image_size=image_size,
+                scale=(0.2, 1.0)
+            )
         
-        transform = TensorAugmentation()
-        dataset = CachedTensorDataset(cache_dir=cache_dir, transform=transform)
-        print(f"✓ Using cached dataset from: {cache_dir}")
+        dataset = CachedTensorDataset(cache_dir=cache_root, transform=transform)
+        print(f"✓ Using cached dataset from: {cache_root}")
+        print(f"  Applying full DINO-style augmentations on cached tensors")
     else:
         # Original mode: load from HuggingFace/raw images
         use_multi_crop = train_config.get('use_multi_crop', False)

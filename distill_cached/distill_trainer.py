@@ -673,20 +673,54 @@ def main():
     else:
         print("⚠️  WARNING: Running on CPU - training will be very slow!")
     
-    # Check cache mode
-    use_cached = data_cfg.get('use_cached', False)
-    if use_cached:
-        cache_dir = data_cfg.get('cache_dir', './cache_images')
-        cache_dir = os.path.expandvars(cache_dir)
+    # Check cache mode (new setting takes precedence)
+    use_cached_tensors = data_cfg.get('use_cached_tensors', data_cfg.get('use_cached', None))
+    
+    # Auto-detect cache if not explicitly set
+    if use_cached_tensors is None:
+        cache_root = data_cfg.get('cache_root', data_cfg.get('cache_dir', './cache_images'))
+        cache_root = os.path.expandvars(cache_root)
+        index_path = os.path.join(cache_root, 'index.json')
+        if os.path.exists(index_path):
+            print(f"✓ Auto-detected cache at {cache_root}, enabling cached tensor mode")
+            use_cached_tensors = True
+        else:
+            use_cached_tensors = False
+    elif use_cached_tensors is False:
+        # Explicitly disabled
+        use_cached_tensors = False
+    else:
+        # Explicitly enabled
+        use_cached_tensors = True
+    
+    if use_cached_tensors:
+        cache_root = data_cfg.get('cache_root', data_cfg.get('cache_dir', './cache_images'))
+        cache_root = os.path.expandvars(cache_root)
+        cache_image_size = data_cfg.get('cache_image_size', 256)
+        cache_dtype = data_cfg.get('cache_dtype', 'float32')
+        
         print(f"✓ Using cached tensor mode")
-        print(f"  Cache directory: {cache_dir}")
+        print(f"  Cache root: {cache_root}")
+        print(f"  Cache image size: {cache_image_size}x{cache_image_size}")
+        print(f"  Cache dtype: {cache_dtype}")
+        print(f"  Applying full DINO-style augmentations during training")
+        
         # Verify cache exists
-        index_path = os.path.join(cache_dir, 'index.json')
+        index_path = os.path.join(cache_root, 'index.json')
         if not os.path.exists(index_path):
             raise FileNotFoundError(
                 f"Cache index not found: {index_path}\n"
                 f"Please run precompute_cache.py first to create the cache."
             )
+        
+        # Load and display cache metadata
+        import json
+        with open(index_path, 'r') as f:
+            cache_meta = json.load(f)
+        print(f"  Cache metadata:")
+        print(f"    Total samples: {cache_meta.get('num_samples', 'unknown'):,}")
+        print(f"    Total shards: {len(cache_meta.get('shards', []))}")
+        print(f"    Cached image size: {cache_meta.get('cache_image_size', 'unknown')}")
     else:
         print(f"✓ Using original dataset mode (HuggingFace/raw images)")
     
