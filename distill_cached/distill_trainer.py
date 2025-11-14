@@ -680,9 +680,17 @@ def main():
     if use_cached_tensors is None:
         cache_root = data_cfg.get('cache_root', data_cfg.get('cache_dir', './cache_images'))
         cache_root = os.path.expandvars(cache_root)
-        index_path = os.path.join(cache_root, 'index.json')
-        if os.path.exists(index_path):
-            print(f"✓ Auto-detected cache at {cache_root}, enabling cached tensor mode")
+        cache_path = Path(cache_root)
+        
+        # Check for new sharded format first, then legacy format
+        shard_index_files = list(cache_path.glob("index_shard_*.json"))
+        legacy_index_path = cache_path / "index.json"
+        
+        if shard_index_files:
+            print(f"✓ Auto-detected cache at {cache_root} ({len(shard_index_files)} shard index files), enabling cached tensor mode")
+            use_cached_tensors = True
+        elif legacy_index_path.exists():
+            print(f"✓ Auto-detected cache at {cache_root} (legacy format), enabling cached tensor mode")
             use_cached_tensors = True
         else:
             use_cached_tensors = False
@@ -705,22 +713,47 @@ def main():
         print(f"  Cache dtype: {cache_dtype}")
         print(f"  Applying full DINO-style augmentations during training")
         
-        # Verify cache exists
-        index_path = os.path.join(cache_root, 'index.json')
-        if not os.path.exists(index_path):
+        # Verify cache exists (check for sharded format first, then legacy)
+        cache_path = Path(cache_root)
+        shard_index_files = list(cache_path.glob("index_shard_*.json"))
+        legacy_index_path = cache_path / "index.json"
+        
+        if not shard_index_files and not legacy_index_path.exists():
             raise FileNotFoundError(
-                f"Cache index not found: {index_path}\n"
+                f"Cache index not found in {cache_root}\n"
+                f"Expected either:\n"
+                f"  - New format: index_shard_*.json files\n"
+                f"  - Legacy format: index.json\n"
                 f"Please run precompute_cache.py first to create the cache."
             )
         
         # Load and display cache metadata
         import json
-        with open(index_path, 'r') as f:
-            cache_meta = json.load(f)
-        print(f"  Cache metadata:")
-        print(f"    Total samples: {cache_meta.get('num_samples', 'unknown'):,}")
-        print(f"    Total shards: {len(cache_meta.get('shards', []))}")
-        print(f"    Cached image size: {cache_meta.get('cache_image_size', 'unknown')}")
+        if shard_index_files:
+            # New sharded format: merge metadata from all shard indices
+            total_samples = 0
+            total_cache_files = 0
+            cache_image_size = None
+            for shard_index_path in sorted(shard_index_files):
+                with open(shard_index_path, 'r') as f:
+                    shard_meta = json.load(f)
+                total_samples += shard_meta.get('num_samples_in_slice', 0)
+                total_cache_files += len(shard_meta.get('shards', []))
+                if cache_image_size is None:
+                    cache_image_size = shard_meta.get('cache_image_size', 'unknown')
+            print(f"  Cache metadata (sharded format):")
+            print(f"    Total samples: {total_samples:,}")
+            print(f"    Processing shards: {len(shard_index_files)}")
+            print(f"    Total cache files: {total_cache_files}")
+            print(f"    Cached image size: {cache_image_size}")
+        else:
+            # Legacy format
+            with open(legacy_index_path, 'r') as f:
+                cache_meta = json.load(f)
+            print(f"  Cache metadata (legacy format):")
+            print(f"    Total samples: {cache_meta.get('num_samples', 'unknown'):,}")
+            print(f"    Total cache files: {len(cache_meta.get('shards', []))}")
+            print(f"    Cached image size: {cache_meta.get('cache_image_size', 'unknown')}")
     else:
         print(f"✓ Using original dataset mode (HuggingFace/raw images)")
     

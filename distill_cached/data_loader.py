@@ -110,35 +110,77 @@ class CachedTensorDataset(Dataset):
     Dataset that loads preprocessed tensors from cached shard files.
     
     This dataset reads from shard files created by precompute_cache.py.
+    Supports both legacy single index.json format and new sharded format (index_shard_*.json).
     Each shard contains unnormalized tensors [N, 3, H, W] in range [0, 1].
     The transform should normalize and apply augmentations.
     """
     def __init__(self, cache_dir: str, transform=None):
         """
         Args:
-            cache_dir: Directory containing cached shard files and index.json
+            cache_dir: Directory containing cached shard files and index file(s)
             transform: Transform to apply to each image tensor (should normalize + augment)
         """
         self.cache_dir = Path(cache_dir)
         self.transform = transform
         
-        # Load index.json
-        index_path = self.cache_dir / "index.json"
-        if not index_path.exists():
+        # Try to load sharded index files first (new format), fallback to legacy index.json
+        shard_index_files = sorted(self.cache_dir.glob("index_shard_*.json"))
+        legacy_index_path = self.cache_dir / "index.json"
+        
+        if shard_index_files:
+            # New sharded format: load and merge all shard index files
+            print(f"✓ Found {len(shard_index_files)} shard index files (parallel processing format)")
+            all_shards = []
+            cache_image_size = None
+            cache_dtype = None
+            total_samples = 0
+            
+            for shard_index_path in shard_index_files:
+                with open(shard_index_path, 'r') as f:
+                    shard_index = json.load(f)
+                
+                # Extract metadata from first shard (should be consistent across all)
+                if cache_image_size is None:
+                    cache_image_size = shard_index.get("cache_image_size", 256)
+                    cache_dtype = shard_index.get("cache_dtype", "float32")
+                
+                # Add all cache files from this shard index
+                for cache_entry in shard_index.get("shards", []):
+                    all_shards.append(cache_entry)
+                
+                # Accumulate total samples
+                total_samples += shard_index.get("num_samples_in_slice", 0)
+            
+            # Sort all cache files by global_start to maintain order
+            all_shards.sort(key=lambda x: x["global_start"])
+            
+            self.num_samples = total_samples
+            self.shards = all_shards
+            self.cache_image_size = cache_image_size
+            self.cache_dtype = cache_dtype
+            
+            print(f"  Merged {len(shard_index_files)} shard indices into {len(all_shards)} cache files")
+        elif legacy_index_path.exists():
+            # Legacy format: single index.json
+            print(f"✓ Found legacy index.json format")
+            with open(legacy_index_path, 'r') as f:
+                index = json.load(f)
+            
+            self.num_samples = index["num_samples"]
+            self.shards = index["shards"]
+            self.cache_image_size = index.get("cache_image_size", 256)
+            self.cache_dtype = index.get("cache_dtype", "float32")
+        else:
             raise FileNotFoundError(
-                f"Index file not found: {index_path}\n"
+                f"No index files found in {self.cache_dir}\n"
+                f"Expected either:\n"
+                f"  - New format: index_shard_*.json files\n"
+                f"  - Legacy format: index.json\n"
                 f"Please run precompute_cache.py first to create the cache."
             )
         
-        with open(index_path, 'r') as f:
-            index = json.load(f)
-        
-        self.num_samples = index["num_samples"]
-        self.shards = index["shards"]
-        self.cache_image_size = index.get("cache_image_size", 256)
-        self.cache_dtype = index.get("cache_dtype", "float32")
-        
         # Build prefix sum for efficient idx -> shard mapping
+        # Note: prefix sum is based on num_samples in each cache file, not global_start
         self.shard_prefix_sum = [0]
         for shard in self.shards:
             self.shard_prefix_sum.append(self.shard_prefix_sum[-1] + shard["num_samples"])
@@ -146,7 +188,7 @@ class CachedTensorDataset(Dataset):
         # In-memory cache for loaded shards (per-epoch caching)
         self._shard_cache: Dict[str, torch.Tensor] = {}
         
-        print(f"✓ Loaded cached dataset: {self.num_samples} samples in {len(self.shards)} shards")
+        print(f"✓ Loaded cached dataset: {self.num_samples:,} samples in {len(self.shards)} cache files")
         print(f"  Cache image size: {self.cache_image_size}x{self.cache_image_size}")
         print(f"  Cache dtype: {self.cache_dtype}")
     
@@ -284,9 +326,17 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     if use_cached_tensors is None:
         cache_root = data_config.get('cache_root', data_config.get('cache_dir', './cache_images'))
         cache_root = os.path.expandvars(cache_root)
-        index_path = os.path.join(cache_root, 'index.json')
-        if os.path.exists(index_path):
-            print(f"✓ Auto-detected cache at {cache_root}, enabling cached tensor mode")
+        cache_path = Path(cache_root)
+        
+        # Check for new sharded format first, then legacy format
+        shard_index_files = list(cache_path.glob("index_shard_*.json"))
+        legacy_index_path = cache_path / "index.json"
+        
+        if shard_index_files:
+            print(f"✓ Auto-detected cache at {cache_root} ({len(shard_index_files)} shard index files), enabling cached tensor mode")
+            use_cached_tensors = True
+        elif legacy_index_path.exists():
+            print(f"✓ Auto-detected cache at {cache_root} (legacy format), enabling cached tensor mode")
             use_cached_tensors = True
         else:
             use_cached_tensors = False
