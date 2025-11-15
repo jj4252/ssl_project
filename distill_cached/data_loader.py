@@ -154,12 +154,26 @@ class CachedTensorDataset(Dataset):
             # Sort all cache files by global_start to maintain order
             all_shards.sort(key=lambda x: x["global_start"])
             
-            self.num_samples = total_samples
+            # Build mapping from dataset index to global_start for partial cache support
+            # When only a subset of shards exists, we need to map dataset indices (0-N) 
+            # to the actual global_start values in cache files
+            self._index_to_global = []
+            for shard_entry in all_shards:
+                global_start = shard_entry["global_start"]
+                num_samples = shard_entry["num_samples"]
+                # Add all indices covered by this cache file
+                for i in range(num_samples):
+                    self._index_to_global.append(global_start + i)
+            
+            # Set num_samples to actual available samples (may be less than sum if gaps exist)
+            self.num_samples = len(self._index_to_global)
             self.shards = all_shards
             self.cache_image_size = cache_image_size
             self.cache_dtype = cache_dtype
             
             print(f"  Merged {len(shard_index_files)} shard indices into {len(all_shards)} cache files")
+            if self.num_samples != total_samples:
+                print(f"  ⚠️  Note: {total_samples:,} samples in shard indices, but {self.num_samples:,} actually available (gaps may exist)")
         elif legacy_index_path.exists():
             # Legacy format: single index.json
             print(f"✓ Found legacy index.json format")
@@ -179,8 +193,16 @@ class CachedTensorDataset(Dataset):
                 f"Please run precompute_cache.py first to create the cache."
             )
         
-        # Build prefix sum for efficient idx -> shard mapping
-        # Note: prefix sum is based on num_samples in each cache file, not global_start
+        # Build mapping for efficient idx -> shard lookup
+        # For parallel sharded format, we need to map global dataset indices to cache files
+        # Each cache file has a global_start that indicates its position in the original dataset
+        # We'll use binary search on global_start values to find the right cache file
+        
+        # Sort shards by global_start for binary search
+        self.shards.sort(key=lambda x: x["global_start"])
+        
+        # Build prefix sum for sequential access (for legacy format compatibility)
+        # But for sharded format, we'll use global_start-based lookup
         self.shard_prefix_sum = [0]
         for shard in self.shards:
             self.shard_prefix_sum.append(self.shard_prefix_sum[-1] + shard["num_samples"])
@@ -217,30 +239,78 @@ class CachedTensorDataset(Dataset):
         Find which shard contains the given global index.
         
         Args:
-            idx: Global sample index
+            idx: Global sample index (0-based, corresponds to original dataset position)
         
         Returns:
             Tuple of (shard_index, local_index_within_shard)
         """
-        # Binary search for the shard containing this index
-        left, right = 0, len(self.shard_prefix_sum) - 1
-        while left < right:
-            mid = (left + right + 1) // 2
-            if self.shard_prefix_sum[mid] <= idx:
-                left = mid
-            else:
-                right = mid - 1
-        
-        shard_idx = left
-        local_idx = idx - self.shard_prefix_sum[shard_idx]
-        return shard_idx, local_idx
+        # Check if shards have global_start (parallel sharded format)
+        # If they do, use global_start-based lookup
+        if self.shards and "global_start" in self.shards[0]:
+            # Binary search based on global_start to find the cache file containing this index
+            # Cache files are sorted by global_start, and each covers [global_start, global_start + num_samples)
+            left, right = 0, len(self.shards) - 1
+            best_shard_idx = -1
+            
+            while left <= right:
+                mid = (left + right) // 2
+                shard_info = self.shards[mid]
+                shard_global_start = shard_info["global_start"]
+                shard_num_samples = shard_info["num_samples"]
+                shard_global_end = shard_global_start + shard_num_samples
+                
+                if shard_global_start <= idx < shard_global_end:
+                    # Found the shard containing this index
+                    best_shard_idx = mid
+                    break
+                elif idx < shard_global_start:
+                    # Index is before this shard, search left
+                    right = mid - 1
+                else:
+                    # Index is after this shard, search right
+                    left = mid + 1
+            
+            if best_shard_idx == -1:
+                # Fallback: use the last shard if index is at the boundary
+                if idx >= self.shards[-1]["global_start"]:
+                    best_shard_idx = len(self.shards) - 1
+                else:
+                    raise IndexError(
+                        f"Index {idx} not found in any cache file. "
+                        f"Valid range: [0, {self.shards[-1]['global_start'] + self.shards[-1]['num_samples']})"
+                    )
+            
+            shard_info = self.shards[best_shard_idx]
+            local_idx = idx - shard_info["global_start"]
+            
+            # Safety check
+            if local_idx < 0 or local_idx >= shard_info["num_samples"]:
+                raise IndexError(
+                    f"Local index {local_idx} out of range for shard {best_shard_idx} "
+                    f"(global_start={shard_info['global_start']}, num_samples={shard_info['num_samples']})"
+                )
+            
+            return best_shard_idx, local_idx
+        else:
+            # Legacy format: use prefix sum (sequential)
+            left, right = 0, len(self.shard_prefix_sum) - 1
+            while left < right:
+                mid = (left + right + 1) // 2
+                if self.shard_prefix_sum[mid] <= idx:
+                    left = mid
+                else:
+                    right = mid - 1
+            
+            shard_idx = left
+            local_idx = idx - self.shard_prefix_sum[shard_idx]
+            return shard_idx, local_idx
     
     def __getitem__(self, idx: int) -> torch.Tensor:
         """
         Get a single image tensor with augmentations applied.
         
         Args:
-            idx: Global sample index
+            idx: Dataset sample index (0-based, relative to available cache)
         
         Returns:
             Tensor of shape [3, H, W] (normalized and augmented)
@@ -248,8 +318,16 @@ class CachedTensorDataset(Dataset):
         if idx < 0 or idx >= self.num_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.num_samples})")
         
-        # Find which shard contains this index
-        shard_idx, local_idx = self._find_shard(idx)
+        # Map dataset index to global_start if using partial cache
+        if hasattr(self, '_index_to_global') and self._index_to_global:
+            # Map dataset index to actual global index in cache files
+            global_idx = self._index_to_global[idx]
+        else:
+            # Legacy format or full cache: use index directly
+            global_idx = idx
+        
+        # Find which shard contains this global index
+        shard_idx, local_idx = self._find_shard(global_idx)
         shard_info = self.shards[shard_idx]
         
         # Load shard (cached in memory)
