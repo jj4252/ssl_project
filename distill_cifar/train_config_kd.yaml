@@ -1,0 +1,41 @@
+# Knowledge Distillation Training Config for CIFAR-10/100
+# Quick test setup with 20K images
+
+# Training hyperparameters
+batch_size: 64
+num_epochs: 10  # Reduced for quick testing
+learning_rate: 0.0005  # 5e-4
+weight_decay: 0.04
+warmup_epochs: 2  # Reduced warmup for shorter training
+min_lr: 1e-6
+
+# No step-capped training - use full dataset (20K images)
+# max_steps_per_epoch: null  # Not set - will use full dataset
+
+# Distillation loss weights
+distill_loss_weights:
+  cls: 1.0      # CLS token loss weight
+  patch: 0.5    # Patch token loss weight
+
+# Data augmentation (simplified for speed)
+use_multi_crop: false  # Use simple single-crop transform
+use_local_crops: false  # Disable local crops (major speedup)
+
+# Teacher feature caching (optional, major speedup)
+cache_teacher_features: false  # Set to true to cache teacher features
+teacher_feature_dir: "/scratch/$USER/ssl_project/cache/features"
+
+# Optimization settings
+compile_student: true   # Compile only student (never compile teacher)
+use_fused_adamw: true   # Use fused AdamW optimizer
+
+# DataLoader settings
+num_workers: 4
+persistent_workers: false  # Must be false to avoid KeyError
+prefetch_factor: 2
+pin_memory: true
+
+# Checkpointing
+checkpoint_dir: "./checkpoints"
+save_every: 100  # Save checkpoint every N steps (0 = only at end of epoch)
+

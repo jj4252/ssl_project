@@ -1,0 +1,16 @@
+# Data loading configuration for CIFAR-10/100
+
+# Dataset configuration
+dataset_name: "cifar10"  # Options: "cifar10" or "cifar100"
+dataset_root: "./data"  # Root directory for CIFAR data (will download if not present)
+max_samples: 20000  # Limit to 20K images for quick testing
+
+# Image size
+image_size: 224  # Match student image size (CIFAR will be upscaled)
+
+# DataLoader settings
+num_workers: 4
+persistent_workers: false
+prefetch_factor: 2
+pin_memory: true
+
