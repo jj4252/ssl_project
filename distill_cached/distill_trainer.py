@@ -131,16 +131,17 @@ def build_student_model(model_name="vit_small_patch16_224",
 
 
 def extract_teacher_features(teacher, images, use_cls_token=True, 
-                            cache_dir=None, cache_key=None):
+                            cache_dir=None, cache_key=None, teacher_img_size=224):
     """
     Extract features from frozen teacher model with optional caching
     
     Args:
-        teacher: DINOv2 teacher model
-        images: Input images [B, 3, H, W]
+        teacher: DINOv2 teacher model (expects 224x224 input)
+        images: Input images [B, 3, H, W] (may be 96x96)
         use_cls_token: Whether to use CLS token or mean-pool patches
         cache_dir: Optional directory to cache features
         cache_key: Optional key for caching (e.g., batch index)
+        teacher_img_size: Target size for teacher (default 224x224 for DINOv2)
     
     Returns:
         cls_embedding: [B, D] CLS token embedding
@@ -154,6 +155,15 @@ def extract_teacher_features(teacher, images, use_cls_token=True,
             return cached['cls'], cached['patches']
     
     with torch.no_grad():
+        # Upscale images to teacher's expected size (96x96 -> 224x224)
+        if images.shape[-1] != teacher_img_size or images.shape[-2] != teacher_img_size:
+            images = F.interpolate(
+                images, 
+                size=(teacher_img_size, teacher_img_size), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
         # DINOv2 forward_features may return dict or tensor
         features = teacher.forward_features(images)
         

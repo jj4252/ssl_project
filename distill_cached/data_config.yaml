@@ -1,7 +1,7 @@
 # Data loading configuration (optimized for speed)
 
 dataset_name: "tsbpp/fall2025_deeplearning"
-image_size: 224  # Match student image size
+image_size: 96  # Match original image size (96x96) - student operates at native resolution
 num_workers: 4  # Optimized for Slurm
 persistent_workers: false  # Must be false
 prefetch_factor: 2
@@ -12,7 +12,7 @@ pin_memory: true
 # Set to false to explicitly disable cached mode even if cache exists
 use_cached_tensors: null  # null = auto-detect, true = force enable, false = force disable
 cache_root: "/scratch/jj4252/Nov_14_distill/cache_images"  # Root directory for cached tensors
-cache_image_size: 256  # Target size to store (larger than training size for crop flexibility)
+cache_image_size: 96  # Match original image size (96x96) - no need to cache larger
 cache_dtype: "float32"  # Data type for cached tensors (float32 or float16)
 cache_shard_size: 2048  # Number of samples per shard file
 
