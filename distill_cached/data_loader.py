@@ -114,11 +114,13 @@ class CachedTensorDataset(Dataset):
     Each shard contains unnormalized tensors [N, 3, H, W] in range [0, 1].
     The transform should normalize and apply augmentations.
     """
-    def __init__(self, cache_dir: str, transform=None):
+    def __init__(self, cache_dir: str, transform=None, max_shards: int = None, max_samples: int = None):
         """
         Args:
             cache_dir: Directory containing cached shard files and index file(s)
             transform: Transform to apply to each image tensor (should normalize + augment)
+            max_shards: Optional limit on number of shard files to use (for testing)
+            max_samples: Optional limit on total number of samples to use (for testing)
         """
         self.cache_dir = Path(cache_dir)
         self.transform = transform
@@ -154,6 +156,11 @@ class CachedTensorDataset(Dataset):
             # Sort all cache files by global_start to maintain order
             all_shards.sort(key=lambda x: x["global_start"])
             
+            # Apply subset limits if specified (for testing)
+            if max_shards is not None and max_shards > 0:
+                all_shards = all_shards[:max_shards]
+                print(f"  ⚠️  Limited to first {max_shards} shard files (for testing)")
+            
             # Build mapping from dataset index to global_start for partial cache support
             # When only a subset of shards exists, we need to map dataset indices (0-N) 
             # to the actual global_start values in cache files
@@ -164,6 +171,20 @@ class CachedTensorDataset(Dataset):
                 # Add all indices covered by this cache file
                 for i in range(num_samples):
                     self._index_to_global.append(global_start + i)
+                    # Apply max_samples limit if specified
+                    if max_samples is not None and len(self._index_to_global) >= max_samples:
+                        break
+                if max_samples is not None and len(self._index_to_global) >= max_samples:
+                    break
+            
+            # Apply max_samples limit if specified
+            if max_samples is not None and max_samples > 0:
+                self._index_to_global = self._index_to_global[:max_samples]
+                # Also limit shards to only those that are actually used
+                used_global_indices = set(self._index_to_global)
+                all_shards = [s for s in all_shards 
+                             if any(used_global_indices & set(range(s["global_start"], s["global_start"] + s["num_samples"])))]
+                print(f"  ⚠️  Limited to first {max_samples:,} samples (for testing)")
             
             # Set num_samples to actual available samples (may be less than sum if gaps exist)
             self.num_samples = len(self._index_to_global)
@@ -180,10 +201,30 @@ class CachedTensorDataset(Dataset):
             with open(legacy_index_path, 'r') as f:
                 index = json.load(f)
             
-            self.num_samples = index["num_samples"]
             self.shards = index["shards"]
             self.cache_image_size = index.get("cache_image_size", 256)
             self.cache_dtype = index.get("cache_dtype", "float32")
+            
+            # Apply subset limits if specified (for testing)
+            if max_shards is not None and max_shards > 0:
+                self.shards = self.shards[:max_shards]
+                print(f"  ⚠️  Limited to first {max_shards} shard files (for testing)")
+            
+            # Build index mapping for legacy format (sequential, no global_start)
+            # Legacy format assumes sequential shards starting from 0
+            total_samples_available = sum(s["num_samples"] for s in self.shards)
+            self._index_to_global = list(range(total_samples_available))
+            
+            if max_samples is not None and max_samples > 0:
+                self._index_to_global = self._index_to_global[:max_samples]
+                # Limit shards to only those needed
+                samples_per_shard = self.shards[0]["num_samples"] if self.shards else 0
+                if samples_per_shard > 0:
+                    num_shards_needed = (max_samples + samples_per_shard - 1) // samples_per_shard
+                    self.shards = self.shards[:num_shards_needed]
+                print(f"  ⚠️  Limited to first {max_samples:,} samples (for testing)")
+            
+            self.num_samples = len(self._index_to_global)
         else:
             raise FileNotFoundError(
                 f"No index files found in {self.cache_dir}\n"
@@ -450,7 +491,16 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
                 scale=(0.2, 1.0)
             )
         
-        dataset = CachedTensorDataset(cache_dir=cache_root, transform=transform)
+        # Get subset limits for testing (if specified)
+        max_shards = data_config.get('max_shards', None)
+        max_samples = data_config.get('max_samples', None)
+        
+        dataset = CachedTensorDataset(
+            cache_dir=cache_root, 
+            transform=transform,
+            max_shards=max_shards,
+            max_samples=max_samples
+        )
         print(f"✓ Using cached dataset from: {cache_root}")
         print(f"  Applying full DINO-style augmentations on cached tensors")
     else:

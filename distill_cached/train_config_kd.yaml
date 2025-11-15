@@ -30,9 +30,9 @@ compile_student: true   # Compile only student (never compile teacher)
 use_fused_adamw: true   # Use fused AdamW optimizer
 
 # DataLoader settings (optimized for Slurm)
-num_workers: 4
+num_workers: 2  # Reduced to prevent OOM (was 4)
 persistent_workers: false  # Must be false to avoid KeyError
-prefetch_factor: 2
+prefetch_factor: 1  # Reduced to prevent OOM (was 2)
 pin_memory: true
 
 # Checkpointing
