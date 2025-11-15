@@ -156,9 +156,11 @@ def gaussian_blur_tensor(
     
     sigma_val = random.uniform(sigma[0], sigma[1])
     
-    # Create Gaussian kernel
-    kernel = _get_gaussian_kernel(kernel_size, sigma_val, img.dtype, img.device)
-    kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(3, 1, 1, 1)
+    # Create 2D Gaussian kernel from 1D kernel (outer product)
+    kernel_1d = _get_gaussian_kernel(kernel_size, sigma_val, img.dtype, img.device)
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]  # Outer product: [kernel_size, kernel_size]
+    kernel_2d = kernel_2d / kernel_2d.sum()  # Normalize
+    kernel = kernel_2d.view(1, 1, kernel_size, kernel_size).repeat(3, 1, 1, 1)
     
     # Apply blur (conv2d expects [B, C, H, W])
     img_blurred = F.conv2d(
