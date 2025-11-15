@@ -103,29 +103,91 @@ def build_student_model(model_name="vit_small_patch16_224",
     Build student ViT model from timm (random initialization)
     
     Args:
-        model_name: timm model name (e.g., "vit_small_patch16_224")
-        img_size: Input image size
+        model_name: timm model name (e.g., "vit_small_patch16_224" or "vit_small_patch16")
+        img_size: Input image size (will override model default if different)
         device: Device to load model on
     
     Returns:
         Student model (trainable)
     """
-    print(f"Building student model: {model_name}")
-    student = timm.create_model(
-        model_name,
-        pretrained=False,  # Random initialization
-        img_size=img_size,
-        num_classes=0,  # No classification head
-    )
+    print(f"Building student model: {model_name} with img_size={img_size}")
+    
+    # Try to create model with custom img_size
+    try:
+        student = timm.create_model(
+            model_name,
+            pretrained=False,  # Random initialization
+            img_size=img_size,
+            num_classes=0,  # No classification head
+        )
+    except Exception as e:
+        # If model creation fails (e.g., model name doesn't support custom size),
+        # try creating with default size and then patch it
+        print(f"  Warning: Could not create model with img_size={img_size}, trying default size first...")
+        print(f"  Error: {e}")
+        student = timm.create_model(
+            model_name,
+            pretrained=False,
+            num_classes=0,
+        )
+    
+    # Always patch patch_embed to ensure it matches desired img_size
+    # (Some models may ignore img_size parameter or have hardcoded checks)
+    if hasattr(student, 'patch_embed'):
+        # Get current patch size
+        if hasattr(student.patch_embed, 'patch_size'):
+            patch_size = student.patch_embed.patch_size
+            if isinstance(patch_size, (list, tuple)):
+                patch_size = patch_size[0]
+        else:
+            # Default patch size for ViT-S/16
+            patch_size = 16
+        
+        # Check current img_size
+        current_img_size = None
+        if hasattr(student.patch_embed, 'img_size'):
+            current_img_size = student.patch_embed.img_size
+            if isinstance(current_img_size, (list, tuple)):
+                current_img_size = current_img_size[0]
+        
+        # Calculate new grid size
+        grid_size = img_size // patch_size
+        
+        # Patch if needed
+        if current_img_size != img_size:
+            print(f"  Patching patch_embed from {current_img_size}x{current_img_size} to {img_size}x{img_size}")
+            if hasattr(student.patch_embed, 'img_size'):
+                student.patch_embed.img_size = (img_size, img_size)
+            
+            # Update grid_size and num_patches
+            if hasattr(student.patch_embed, 'grid_size'):
+                student.patch_embed.grid_size = (grid_size, grid_size)
+            if hasattr(student.patch_embed, 'num_patches'):
+                student.patch_embed.num_patches = grid_size * grid_size
+            
+            print(f"  ✓ Patched: patch_size={patch_size}, grid_size={grid_size}x{grid_size}, num_patches={grid_size * grid_size}")
+    
     student = student.to(device)
     student.train()
     
     num_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     
-    print(f"✓ Student created: {model_name}")
-    print(f"  Parameters: {num_params / 1e6:.2f}M")
-    print(f"  Trainable: {trainable_params / 1e6:.2f}M")
+    # Verify the model accepts the desired img_size
+    if hasattr(student, 'patch_embed') and hasattr(student.patch_embed, 'img_size'):
+        actual_img_size = student.patch_embed.img_size
+        if isinstance(actual_img_size, (list, tuple)):
+            actual_img_size = actual_img_size[0]
+        print(f"✓ Student created: {model_name}")
+        print(f"  Parameters: {num_params / 1e6:.2f}M")
+        print(f"  Trainable: {trainable_params / 1e6:.2f}M")
+        print(f"  Image size: {actual_img_size}x{actual_img_size}")
+        if actual_img_size != img_size:
+            print(f"  ⚠️  Warning: Model img_size ({actual_img_size}) != requested ({img_size})")
+    else:
+        print(f"✓ Student created: {model_name}")
+        print(f"  Parameters: {num_params / 1e6:.2f}M")
+        print(f"  Trainable: {trainable_params / 1e6:.2f}M")
     
     return student
 
