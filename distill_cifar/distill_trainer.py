@@ -704,8 +704,10 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         batch_start = time.time()
         
         # Handle batch format: either (view1, view2) for SSL or single image
-        if ssl_config and ssl_config.get('enabled', False) and isinstance(batch, tuple) and len(batch) == 2:
-            # Two views for SSL (Barlow Twins)
+        # When SSL is enabled, DataLoader collates tuples into (batch_view1, batch_view2)
+        # Check for tuple first (SSL mode returns tuple of two batched views)
+        if isinstance(batch, tuple) and len(batch) == 2:
+            # Two views for SSL (Barlow Twins) - batch is (batch_view1, batch_view2)
             images_view1 = batch[0].to(device)
             images_view2 = batch[1].to(device)
             images = images_view1  # Use view1 for KD (can also use view2, doesn't matter)
@@ -717,8 +719,17 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 images = images.to(memory_format=torch.channels_last)
             except:
                 pass
-        elif use_multi_crop and isinstance(batch, list):
-            images = batch[0].to(device)  # Use first global crop
+        elif isinstance(batch, list):
+            # Multi-crop mode or list of crops
+            if use_multi_crop:
+                images = batch[0].to(device)  # Use first global crop
+            else:
+                # List but not multi-crop - might be a single-element list or unexpected format
+                # Try to handle it gracefully
+                if len(batch) > 0:
+                    images = batch[0].to(device) if isinstance(batch[0], torch.Tensor) else torch.stack(batch).to(device)
+                else:
+                    raise ValueError(f"Empty batch list encountered")
             images_view1 = images  # For compatibility
             images_view2 = images  # Fallback (won't be used for SSL)
             
@@ -727,7 +738,8 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 images = images.to(memory_format=torch.channels_last)
             except:
                 pass
-        else:
+        elif isinstance(batch, torch.Tensor):
+            # Single image tensor (normal case when SSL is disabled)
             images = batch.to(device)
             images_view1 = images  # For compatibility
             images_view2 = images  # Fallback (won't be used for SSL)
@@ -737,6 +749,9 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 images = images.to(memory_format=torch.channels_last)
             except:
                 pass
+        else:
+            # Unexpected batch format
+            raise TypeError(f"Unexpected batch type: {type(batch)}. Expected tuple (for SSL), list (for multi-crop), or Tensor (for single view).")
         
         optimizer.zero_grad()
         
