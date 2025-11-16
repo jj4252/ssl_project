@@ -603,6 +603,16 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
+                    # Debug: Print feature statistics on first batch of first epoch
+                    if batch_idx == 0 and epoch == 0:
+                        print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
+                        print(f"  Teacher CLS: std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
+                        print(f"  Student CLS: std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
+                        cosine_sim = (teacher_cls * student_cls).sum(dim=-1).mean().item()
+                        print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                        print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
+                        print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
+                    
                     # Compute distillation loss
                     loss, metrics = compute_distillation_loss(
                         student_cls, student_patches,
@@ -625,10 +635,21 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
+                    # Debug: Print feature statistics on first batch of first epoch
+                    if batch_idx == 0 and epoch == 0:
+                        print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
+                        print(f"  Teacher CLS: std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
+                        print(f"  Student CLS: std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
+                        cosine_sim = (teacher_cls * student_cls).sum(dim=-1).mean().item()
+                        print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                        print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
+                        print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
+                    
                     loss, metrics = compute_distillation_loss(
                         student_cls, student_patches,
                         teacher_cls, teacher_patches,
-                        loss_weights=loss_weights
+                        loss_weights=loss_weights,
+                        distillation_loss_module=distillation_loss_module
                     )
         else:
             # CPU: no autocast
@@ -644,6 +665,16 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
             student_cls, student_patches = extract_student_features(
                 student, images, use_cls_token=use_cls_token
             )
+            
+            # Debug: Print feature statistics on first batch of first epoch
+            if batch_idx == 0 and epoch == 0:
+                print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
+                print(f"  Teacher CLS: std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
+                print(f"  Student CLS: std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
+                cosine_sim = (teacher_cls * student_cls).sum(dim=-1).mean().item()
+                print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
+                print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
             
             loss, metrics = compute_distillation_loss(
                 student_cls, student_patches,
@@ -681,9 +712,9 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         # Update progress bar with detailed timing
         current_lr = optimizer.param_groups[0]['lr']
         progress_bar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'cls': f'{metrics["cls"]:.4f}',
-            'patch': f'{metrics["patch"]:.4f}',
+            'loss': f'{loss.item():.8f}',
+            'cls': f'{metrics["cls"]:.8f}',
+            'patch': f'{metrics["patch"]:.8f}',
             'lr': f'{current_lr:.6f}',
             'gpu': f'{avg_gpu_time:.2f}s',
             'data': f'{avg_data_time:.2f}s',
@@ -843,8 +874,8 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             distillation_loss_module=distillation_loss_module
         )
         
-        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.4f} "
-              f"(CLS: {avg_metrics['cls']:.4f}, Patch: {avg_metrics['patch']:.4f})")
+        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.8f} "
+              f"(CLS: {avg_metrics['cls']:.8f}, Patch: {avg_metrics['patch']:.8f})")
         
         # Save checkpoint at end of epoch
         if checkpoint_dir:
