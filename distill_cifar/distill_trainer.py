@@ -314,6 +314,8 @@ class ProjectionHead(nn.Module):
     """
     Simple MLP head for SSL representation learning.
     Operates on student CLS embeddings (dim = student_dim, e.g., 384).
+    
+    Note: Does NOT L2-normalize outputs - Barlow Twins loss does its own normalization.
     """
     def __init__(self, in_dim: int, hidden_dim: int = 1024, out_dim: int = 256):
         super().__init__()
@@ -326,8 +328,8 @@ class ProjectionHead(nn.Module):
     def forward(self, x):
         # x: [B, in_dim]
         z = self.net(x)
-        # Normalize for Barlow / cosine
-        return F.normalize(z, dim=-1)
+        # Don't normalize - Barlow Twins will normalize by mean/std per feature dimension
+        return z
 
 
 def off_diagonal(x: torch.Tensor) -> torch.Tensor:
@@ -351,20 +353,26 @@ def barlow_twins_loss(z1: torch.Tensor, z2: torch.Tensor, lambd: float = 5e-3) -
     Barlow Twins loss for self-supervised learning.
     
     Args:
-        z1, z2: [B, d], already normalized projections
+        z1, z2: [B, d], raw projection outputs (NOT pre-normalized)
         lambd: Weight for off-diagonal term (default: 5e-3)
     
     Returns:
         Barlow Twins loss
+    
+    Note:
+        This function normalizes inputs by mean/std per feature dimension internally.
+        The ProjectionHead should NOT L2-normalize its outputs.
     """
     assert z1.shape == z2.shape
     B, D = z1.shape
     
-    # Normalize per batch (zero mean)
-    z1_norm = z1 - z1.mean(dim=0)
-    z2_norm = z2 - z2.mean(dim=0)
+    # Normalize per feature dimension: zero mean and unit variance
+    # This is the standard Barlow Twins normalization
+    z1_norm = (z1 - z1.mean(dim=0, keepdim=True)) / (z1.std(dim=0, keepdim=True) + 1e-8)
+    z2_norm = (z2 - z2.mean(dim=0, keepdim=True)) / (z2.std(dim=0, keepdim=True) + 1e-8)
     
     # Cross-correlation matrix: [D, D]
+    # Each element c_ij = mean over batch of (z1_norm[:, i] * z2_norm[:, j])
     c = (z1_norm.T @ z2_norm) / B
     
     # On-diagonal should be 1, off-diagonal should be 0
