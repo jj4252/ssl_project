@@ -19,7 +19,14 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
+# Try to import new GradScaler API (PyTorch 2.0+), fall back to old API
+try:
+    from torch.amp import GradScaler
+    GRADSCALER_NEW_API = True
+except ImportError:
+    from torch.cuda.amp import GradScaler
+    GRADSCALER_NEW_API = False
+
 # Try to import new autocast API (PyTorch 2.0+), fall back to old API
 try:
     from torch.amp import autocast  # PyTorch 2.0+
@@ -606,10 +613,24 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     # Debug: Print feature statistics on first batch of first epoch
                     if batch_idx == 0 and epoch == 0:
                         print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
-                        print(f"  Teacher CLS: std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
-                        print(f"  Student CLS: std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
-                        cosine_sim = (teacher_cls * student_cls).sum(dim=-1).mean().item()
-                        print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                        print(f"  Teacher CLS: shape={teacher_cls.shape}, std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
+                        print(f"  Student CLS: shape={student_cls.shape}, std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
+                        # Compute cosine similarity (handle dimension mismatch by projecting teacher)
+                        if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                            teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                            teacher_cls_proj_norm = F.normalize(teacher_cls_proj, dim=-1)
+                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                            cosine_sim = (teacher_cls_proj_norm * student_cls_norm).sum(dim=-1).mean().item()
+                        elif teacher_cls.shape[-1] == student_cls.shape[-1]:
+                            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                            cosine_sim = (teacher_cls_norm * student_cls_norm).sum(dim=-1).mean().item()
+                        else:
+                            cosine_sim = None
+                        if cosine_sim is not None:
+                            print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                        else:
+                            print(f"  CLS cosine similarity: N/A (dimension mismatch: {teacher_cls.shape[-1]} vs {student_cls.shape[-1]})")
                         print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
                         print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
                     
@@ -638,10 +659,24 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     # Debug: Print feature statistics on first batch of first epoch
                     if batch_idx == 0 and epoch == 0:
                         print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
-                        print(f"  Teacher CLS: std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
-                        print(f"  Student CLS: std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
-                        cosine_sim = (teacher_cls * student_cls).sum(dim=-1).mean().item()
-                        print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                        print(f"  Teacher CLS: shape={teacher_cls.shape}, std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
+                        print(f"  Student CLS: shape={student_cls.shape}, std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
+                        # Compute cosine similarity (handle dimension mismatch by projecting teacher)
+                        if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                            teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                            teacher_cls_proj_norm = F.normalize(teacher_cls_proj, dim=-1)
+                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                            cosine_sim = (teacher_cls_proj_norm * student_cls_norm).sum(dim=-1).mean().item()
+                        elif teacher_cls.shape[-1] == student_cls.shape[-1]:
+                            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                            cosine_sim = (teacher_cls_norm * student_cls_norm).sum(dim=-1).mean().item()
+                        else:
+                            cosine_sim = None
+                        if cosine_sim is not None:
+                            print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                        else:
+                            print(f"  CLS cosine similarity: N/A (dimension mismatch: {teacher_cls.shape[-1]} vs {student_cls.shape[-1]})")
                         print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
                         print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
                     
@@ -669,10 +704,24 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
             # Debug: Print feature statistics on first batch of first epoch
             if batch_idx == 0 and epoch == 0:
                 print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
-                print(f"  Teacher CLS: std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
-                print(f"  Student CLS: std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
-                cosine_sim = (teacher_cls * student_cls).sum(dim=-1).mean().item()
-                print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                print(f"  Teacher CLS: shape={teacher_cls.shape}, std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
+                print(f"  Student CLS: shape={student_cls.shape}, std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
+                # Compute cosine similarity (handle dimension mismatch by projecting teacher)
+                if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                    teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                    teacher_cls_proj_norm = F.normalize(teacher_cls_proj, dim=-1)
+                    student_cls_norm = F.normalize(student_cls, dim=-1)
+                    cosine_sim = (teacher_cls_proj_norm * student_cls_norm).sum(dim=-1).mean().item()
+                elif teacher_cls.shape[-1] == student_cls.shape[-1]:
+                    teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+                    student_cls_norm = F.normalize(student_cls, dim=-1)
+                    cosine_sim = (teacher_cls_norm * student_cls_norm).sum(dim=-1).mean().item()
+                else:
+                    cosine_sim = None
+                if cosine_sim is not None:
+                    print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
+                else:
+                    print(f"  CLS cosine similarity: N/A (dimension mismatch: {teacher_cls.shape[-1]} vs {student_cls.shape[-1]})")
                 print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
                 print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
             
@@ -829,8 +878,15 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
     scheduler = build_scheduler(optimizer, num_epochs=num_epochs,
                                warmup_epochs=warmup_epochs)
     
-    # GradScaler for mixed precision
-    scaler = GradScaler(enabled=(device.type == 'cuda'))
+    # GradScaler for mixed precision (use new API if available to avoid deprecation warning)
+    if GRADSCALER_NEW_API:
+        if device.type == 'cuda':
+            scaler = GradScaler('cuda')
+        else:
+            scaler = GradScaler('cpu')
+    else:
+        # Old API
+        scaler = GradScaler(enabled=(device.type == 'cuda'))
     
     start_epoch = 0
     global_step = 0
@@ -847,9 +903,8 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         global_step = checkpoint.get('global_step', 0)
         print(f"✓ Resumed from epoch {start_epoch}, step {global_step}")
     
-    # Initialize scheduler
-    if start_epoch == 0:
-        scheduler.step()
+    # Initialize scheduler (call after optimizer.step() in first iteration, not before)
+    # We'll call scheduler.step() at the end of each epoch instead
     
     # Check if dataset supports set_epoch (for random subset sampling)
     dataset = train_loader.dataset
@@ -878,6 +933,7 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
               f"(CLS: {avg_metrics['cls']:.8f}, Patch: {avg_metrics['patch']:.8f})")
         
         # Save checkpoint at end of epoch
+        # Note: scheduler.step() is called at the end of train_epoch() after all optimizer.step() calls
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint = {
