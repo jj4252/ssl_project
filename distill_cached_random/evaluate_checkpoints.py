@@ -32,17 +32,39 @@ def load_config(config_path):
 
 def load_checkpoint(checkpoint_path, device):
     """Load checkpoint and return student model state dict"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    except RuntimeError as e:
+        if "failed reading zip archive" in str(e) or "central directory" in str(e):
+            raise RuntimeError(f"Checkpoint file is corrupted or incomplete: {checkpoint_path}")
+        else:
+            raise
+    
     # Handle different checkpoint formats
     if 'student' in checkpoint:
-        return checkpoint['student']
+        state_dict = checkpoint['student']
     elif 'model' in checkpoint:
-        return checkpoint['model']
+        state_dict = checkpoint['model']
     elif 'state_dict' in checkpoint:
-        return checkpoint['state_dict']
+        state_dict = checkpoint['state_dict']
     else:
         # Assume the checkpoint itself is the state dict
-        return checkpoint
+        state_dict = checkpoint
+    
+    # Handle torch.compile() prefix: compiled models have '_orig_mod.' prefix
+    # Strip this prefix if present to match uncompiled model keys
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        print(f"  Detected compiled model checkpoint (has '_orig_mod.' prefix), stripping prefix...")
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                new_key = key[len('_orig_mod.'):]
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        state_dict = new_state_dict
+    
+    return state_dict
 
 
 def build_student_model(model_config, device):
@@ -205,10 +227,11 @@ def train_linear_probe(train_features, train_labels, test_features, test_labels,
         test_labels = test_labels.numpy()
     
     # Train logistic regression
+    # Note: multi_class='multinomial' is deprecated in sklearn 1.5+, removed in 1.7+
+    # It's now the default behavior, so we omit it
     clf = LogisticRegression(
         C=C,
         max_iter=max_iter,
-        multi_class='multinomial',
         solver='lbfgs',
         n_jobs=-1
     )
@@ -349,6 +372,13 @@ def main():
         
         # Load checkpoint
         try:
+            # Check file size first (corrupted files are often incomplete)
+            file_size = checkpoint_path.stat().st_size
+            if file_size < 1024:  # Less than 1KB is suspicious
+                print(f"  ⚠️  Warning: Checkpoint file is very small ({file_size} bytes), may be corrupted")
+            elif file_size < 10 * 1024 * 1024:  # Less than 10MB is suspicious for a model checkpoint
+                print(f"  ⚠️  Warning: Checkpoint file seems small ({file_size / 1024 / 1024:.2f} MB)")
+            
             state_dict = load_checkpoint(checkpoint_path, device)
             
             # Debug: print checkpoint keys
@@ -375,8 +405,19 @@ def main():
                     print(f"  ⚠️  Loaded with mismatched keys - model may not work correctly")
             
             student.eval()
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "corrupted" in error_msg.lower() or "zip archive" in error_msg.lower() or "central directory" in error_msg.lower():
+                print(f"❌ Checkpoint file is corrupted or incomplete: {checkpoint_path.name}")
+                print(f"   File size: {checkpoint_path.stat().st_size / 1024 / 1024:.2f} MB")
+                print(f"   This checkpoint will be skipped. You may need to delete it and re-train.")
+            else:
+                print(f"❌ Error loading checkpoint {checkpoint_name}: {e}")
+                import traceback
+                traceback.print_exc()
+            continue
         except Exception as e:
-            print(f"❌ Error loading checkpoint {checkpoint_name}: {e}")
+            print(f"❌ Unexpected error loading checkpoint {checkpoint_name}: {e}")
             import traceback
             traceback.print_exc()
             continue
