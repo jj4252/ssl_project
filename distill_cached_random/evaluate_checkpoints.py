@@ -41,6 +41,8 @@ def load_checkpoint(checkpoint_path, device):
             raise
     
     # Handle different checkpoint formats
+    # Note: New checkpoints may also contain 'distillation_loss' key, which is ignored here
+    # (only the student model weights are needed for evaluation)
     if 'student' in checkpoint:
         state_dict = checkpoint['student']
     elif 'model' in checkpoint:
@@ -184,13 +186,49 @@ def extract_features(model, dataloader, device, use_cls_token=True):
             # Forward through frozen backbone
             outputs = model.forward_features(images)
             
-            if use_cls_token:
-                feat = outputs[:, 0]  # CLS token [B, D]
+            # Handle DINOv2 dict output format (teacher model) or tensor format (student model)
+            if isinstance(outputs, dict):
+                # DINOv2 format: extract from dict
+                if 'x_norm_clstoken' in outputs:
+                    cls_embedding = outputs['x_norm_clstoken']  # [B, D] - already normalized
+                    if use_cls_token:
+                        feat = cls_embedding
+                    else:
+                        # Use normalized patch tokens
+                        if 'x_norm_patchtokens' in outputs:
+                            feat = outputs['x_norm_patchtokens'].mean(dim=1)  # [B, D]
+                        else:
+                            feat = cls_embedding  # Fallback to CLS
+                elif 'cls_token' in outputs:
+                    cls_embedding = outputs['cls_token']
+                    if use_cls_token:
+                        feat = cls_embedding
+                    else:
+                        if 'patch_tokens' in outputs:
+                            feat = outputs['patch_tokens'].mean(dim=1)
+                        else:
+                            feat = cls_embedding
+                else:
+                    # Fallback: try to get from 'x' or 'tokens'
+                    tokens = outputs.get('x', outputs.get('tokens', None))
+                    if tokens is not None:
+                        if use_cls_token:
+                            feat = tokens[:, 0]  # CLS token
+                        else:
+                            feat = tokens[:, 1:].mean(dim=1)  # Mean-pool patches
+                    else:
+                        raise ValueError("Could not extract features from DINOv2 dict output")
+                # DINOv2 features are already normalized, but normalize again to be safe
+                feat = F.normalize(feat, dim=-1, p=2)
             else:
-                feat = outputs[:, 1:].mean(dim=1)  # Mean-pool patches [B, D]
-            
-            # Normalize features
-            feat = F.normalize(feat, dim=-1, p=2)
+                # Tensor format (timm models): [B, N+1, D] (CLS + patches)
+                if use_cls_token:
+                    feat = outputs[:, 0]  # CLS token [B, D]
+                else:
+                    feat = outputs[:, 1:].mean(dim=1)  # Mean-pool patches [B, D]
+                
+                # Normalize features
+                feat = F.normalize(feat, dim=-1, p=2)
             
             features.append(feat.cpu())
             labels.append(targets)
@@ -198,6 +236,71 @@ def extract_features(model, dataloader, device, use_cls_token=True):
     features = torch.cat(features, dim=0)
     labels = torch.cat(labels, dim=0)
     return features, labels
+
+
+def analyze_features(features, name="Features"):
+    """
+    Analyze feature quality and diversity.
+    
+    Args:
+        features: [N, D] tensor of features
+        name: Name for the feature set (for printing)
+    
+    Returns:
+        Dict with statistics
+    """
+    features = features.float()  # Ensure float type
+    
+    stats = {
+        'mean': features.mean().item(),
+        'std': features.std().item(),
+        'min': features.min().item(),
+        'max': features.max().item(),
+        'norm': features.norm(dim=-1).mean().item(),
+    }
+    
+    # Per-dimension variance
+    feature_var = features.var(dim=0)
+    stats['var_mean'] = feature_var.mean().item()
+    stats['var_min'] = feature_var.min().item()
+    stats['var_max'] = feature_var.max().item()
+    
+    # Pairwise similarity (sample-based for efficiency)
+    sample_size = min(1000, len(features))
+    sample_features = features[:sample_size]
+    pairwise_sim = (sample_features @ sample_features.T).mean().item()
+    stats['pairwise_sim'] = pairwise_sim
+    stats['sample_size'] = sample_size
+    
+    # Print diagnostics
+    print(f"  🔍 {name} Quality Analysis:")
+    print(f"    Shape: {features.shape}")
+    print(f"    Mean: {stats['mean']:.6f}")
+    print(f"    Std: {stats['std']:.6f}")
+    print(f"    Min: {stats['min']:.6f}")
+    print(f"    Max: {stats['max']:.6f}")
+    print(f"    Feature norm (should be ~1.0): {stats['norm']:.6f}")
+    print(f"    Per-dim variance: mean={stats['var_mean']:.6f}, min={stats['var_min']:.6f}, max={stats['var_max']:.6f}")
+    print(f"    Avg pairwise similarity (first {sample_size}): {stats['pairwise_sim']:.6f}")
+    
+    # Warnings
+    if stats['pairwise_sim'] > 0.9:
+        print(f"    ⚠️  WARNING: Features are highly similar (COLLAPSED)!")
+        print(f"    This explains why accuracy is ~10% (random chance)")
+    elif stats['pairwise_sim'] > 0.7:
+        print(f"    ⚠️  WARNING: Features are too similar (partial collapse)")
+    else:
+        print(f"    ✓ Features have good diversity")
+    
+    if stats['var_mean'] < 0.01:
+        print(f"    ⚠️  WARNING: Very low variance across dimensions (COLLAPSED)!")
+    elif stats['var_mean'] < 0.05:
+        print(f"    ⚠️  WARNING: Low variance across dimensions (partial collapse)")
+    
+    if abs(stats['norm'] - 1.0) > 0.1:
+        print(f"    ⚠️  WARNING: Feature norm is not ~1.0 (normalization issue?)")
+    
+    return stats
 
 
 def train_linear_probe(train_features, train_labels, test_features, test_labels, C=1.0, max_iter=1000):
@@ -299,6 +402,10 @@ def main():
                        help='Output file for results (JSON)')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--eval_teacher', action='store_true',
+                       help='Also evaluate teacher model for comparison')
+    parser.add_argument('--eval_untrained', action='store_true',
+                       help='Also evaluate untrained student (random init) for comparison')
     
     args = parser.parse_args()
     
@@ -354,8 +461,121 @@ def main():
     test_features, test_labels = extract_features(student, test_loader, device, use_cls_token=use_cls_token)
     print(f"  Test features shape: {test_features.shape}")
     
+    # Evaluate teacher model if requested
+    if args.eval_teacher:
+        print(f"\n{'='*60}")
+        print("Evaluating TEACHER model (DINOv2)")
+        print(f"{'='*60}")
+        try:
+            # Import teacher loading function
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from distill_trainer import load_teacher_model
+            
+            teacher = load_teacher_model(
+                teacher_name=model_config.get('teacher_name', 'dinov2_vitb14'),
+                device=device
+            )
+            teacher.eval()
+            
+            # Create a wrapper class that upscales images to 224x224 for teacher
+            class UpscaleDataLoader:
+                """Wrapper dataloader that upscales images to target_size"""
+                def __init__(self, dataloader, target_size=224, device='cuda'):
+                    self.dataloader = dataloader
+                    self.target_size = target_size
+                    self.device = device
+                
+                def __iter__(self):
+                    for images, labels in self.dataloader:
+                        images = images.to(self.device)
+                        # Upscale to teacher's expected size (96x96 -> 224x224)
+                        if images.shape[-1] != self.target_size or images.shape[-2] != self.target_size:
+                            images = F.interpolate(
+                                images,
+                                size=(self.target_size, self.target_size),
+                                mode='bilinear',
+                                align_corners=False
+                            )
+                        yield images, labels
+                
+                def __len__(self):
+                    return len(self.dataloader)
+            
+            teacher_train_loader = UpscaleDataLoader(train_loader, target_size=224, device=device)
+            teacher_test_loader = UpscaleDataLoader(test_loader, target_size=224, device=device)
+            
+            print("🔍 Extracting teacher training features (upscaling 96x96 -> 224x224)...")
+            teacher_train_features, teacher_train_labels = extract_features(
+                teacher, teacher_train_loader, device, use_cls_token=use_cls_token
+            )
+            analyze_features(teacher_train_features, name="Teacher Features")
+            
+            print("🔍 Extracting teacher test features (upscaling 96x96 -> 224x224)...")
+            teacher_test_features, teacher_test_labels = extract_features(
+                teacher, teacher_test_loader, device, use_cls_token=use_cls_token
+            )
+            
+            print("🎯 Training linear probe on teacher features...")
+            teacher_accuracy, _ = train_linear_probe(
+                teacher_train_features, teacher_train_labels,
+                teacher_test_features, teacher_test_labels,
+                C=args.linear_probe_C
+            )
+            print(f"✓ Teacher linear probe accuracy: {teacher_accuracy:.4f} ({teacher_accuracy*100:.2f}%)")
+            
+            # Store teacher result
+            results['teacher'] = {
+                'checkpoint_path': 'teacher_model',
+                'accuracy': float(teacher_accuracy),
+                'accuracy_percent': float(teacher_accuracy * 100),
+                'train_samples': len(teacher_train_features),
+                'test_samples': len(teacher_test_features),
+                'feature_dim': teacher_train_features.shape[1]
+            }
+        except Exception as e:
+            print(f"❌ Error evaluating teacher: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Evaluate untrained student if requested
+    if args.eval_untrained:
+        print(f"\n{'='*60}")
+        print("Evaluating UNTRAINED student (random initialization)")
+        print(f"{'='*60}")
+        
+        # Build fresh untrained student
+        untrained_student = build_student_model(model_config, device)
+        untrained_student.eval()
+        
+        print("🔍 Extracting untrained student training features...")
+        untrained_train_features, untrained_train_labels = extract_features(untrained_student, train_loader, device, use_cls_token=use_cls_token)
+        analyze_features(untrained_train_features, name="Untrained Student Features")
+        
+        print("🔍 Extracting untrained student test features...")
+        untrained_test_features, untrained_test_labels = extract_features(untrained_student, test_loader, device, use_cls_token=use_cls_token)
+        
+        print("🎯 Training linear probe on untrained student features...")
+        untrained_accuracy, _ = train_linear_probe(
+            untrained_train_features, untrained_train_labels,
+            untrained_test_features, untrained_test_labels,
+            C=args.linear_probe_C
+        )
+        print(f"✓ Untrained student linear probe accuracy: {untrained_accuracy:.4f} ({untrained_accuracy*100:.2f}%)")
+        
+        # Store untrained result
+        results['untrained'] = {
+            'checkpoint_path': 'untrained_student',
+            'accuracy': float(untrained_accuracy),
+            'accuracy_percent': float(untrained_accuracy * 100),
+            'train_samples': len(untrained_train_features),
+            'test_samples': len(untrained_test_features),
+            'feature_dim': untrained_train_features.shape[1]
+        }
+    
     # Evaluate each checkpoint
-    results = {}
+    if not results:
+        results = {}
     
     # Sort checkpoints: handle mixed int/str keys by converting to comparable format
     def sort_key(item):
@@ -427,6 +647,9 @@ def main():
         train_features, train_labels = extract_features(student, train_loader, device, use_cls_token=use_cls_token)
         print(f"  Train features shape: {train_features.shape}")
         
+        # Analyze feature quality
+        feature_stats = analyze_features(train_features, name=f"Checkpoint {checkpoint_name} Features")
+        
         # Train linear probe
         print(f"🎯 Training linear probe (C={args.linear_probe_C})...")
         accuracy, clf = train_linear_probe(
@@ -444,7 +667,8 @@ def main():
             'accuracy_percent': float(accuracy * 100),
             'train_samples': len(train_features),
             'test_samples': len(test_features),
-            'feature_dim': train_features.shape[1]
+            'feature_dim': train_features.shape[1],
+            'feature_stats': feature_stats  # Include feature statistics
         }
     
     # Print summary
