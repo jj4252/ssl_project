@@ -672,6 +672,37 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
+                    # Step 1 Diagnostic: Verify representation consistency (training vs evaluation)
+                    # Print feature statistics that should match evaluation
+                    if batch_idx == 0 and epoch == 0:
+                        with torch.no_grad():
+                            # Extract features exactly as evaluation does
+                            eval_features = student.forward_features(images)
+                            if isinstance(eval_features, torch.Tensor):
+                                eval_cls = eval_features[:, 0]  # CLS token [B, D]
+                            else:
+                                eval_cls = eval_features.get('x', eval_features.get('tokens', None))[:, 0]
+                            eval_cls_norm = F.normalize(eval_cls, dim=-1, p=2)
+                            
+                            # Compare with training extraction
+                            train_cls_norm = F.normalize(student_cls, dim=-1, p=2)
+                            
+                            print(f"\n🔍 Step 1 Diagnostic: Training vs Evaluation Representation Consistency")
+                            print(f"  Training CLS (extract_student_features): shape={student_cls.shape}, "
+                                  f"norm={train_cls_norm.norm(dim=-1).mean().item():.6f}, "
+                                  f"std={train_cls_norm.std().item():.6f}")
+                            print(f"  Eval CLS (forward_features[:, 0]): shape={eval_cls.shape}, "
+                                  f"norm={eval_cls_norm.norm(dim=-1).mean().item():.6f}, "
+                                  f"std={eval_cls_norm.std().item():.6f}")
+                            
+                            # Check if they match
+                            diff = (train_cls_norm - eval_cls_norm).abs().mean().item()
+                            if diff < 1e-5:
+                                print(f"  ✓ Representations match (diff={diff:.8f})")
+                            else:
+                                print(f"  ⚠️  WARNING: Representations differ (diff={diff:.8f})")
+                                print(f"     This could cause train/eval mismatch!")
+                    
                     # Sanity debug: log statistics for initial batches
                     # This helps verify teacher targets are diverse and student is learning
                     if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):

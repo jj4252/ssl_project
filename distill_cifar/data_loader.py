@@ -85,9 +85,15 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     image_size = data_config.get('image_size', 96)  # Match student model size
     use_multi_crop = train_config.get('use_multi_crop', False)
     use_local_crops = train_config.get('use_local_crops', False)
+    use_minimal_aug = train_config.get('use_minimal_aug', False)  # Step 3 diagnostic: minimal augmentation
     
     # Create transforms
-    if use_multi_crop:
+    if use_minimal_aug:
+        # Step 3 diagnostic: Minimal augmentation (only resize + flip, no crop/blur)
+        from transforms import MinimalTransform
+        transform = MinimalTransform(image_size=image_size)
+        print("✓ Using minimal augmentation (diagnostic mode: resize + flip only)")
+    elif use_multi_crop:
         transform = FastMultiCropTransform(
             global_crops_scale=tuple(data_config.get('global_crops_scale', [0.4, 1.0])),
             local_crops_scale=tuple(data_config.get('local_crops_scale', [0.05, 0.4])),

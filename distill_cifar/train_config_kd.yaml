@@ -1,9 +1,15 @@
 # Knowledge Distillation Training Config for CIFAR10
 # Same methodology as distill_cached_random, but training on CIFAR10
+#
+# DIAGNOSTIC STEPS:
+# Step 1: Verify representation consistency - automatically checked at training start
+# Step 2: CLS-only KD - set distill_loss_weights.patch: 0.0
+# Step 3: Minimal augmentation - set use_minimal_aug: true
+# Step 4: Supervised baseline - not implemented (requires separate training script)
 
 # Training hyperparameters
 batch_size: 64
-num_epochs: 100
+num_epochs: 20
 learning_rate: 0.0005  # 5e-4
 weight_decay: 0.04
 warmup_epochs: 10
@@ -14,13 +20,17 @@ min_lr: 1e-6
 # max_steps_per_epoch: null  # Use all batches (no cap)
 
 # Distillation loss weights
+# DIAGNOSTIC: For CLS-only KD experiment, set patch: 0.0
+# This tests if patch loss is interfering with CLS learning
 distill_loss_weights:
   cls: 1.0      # CLS token loss weight
-  patch: 0.5    # Patch token loss weight
+  patch: 0.5    # Patch token loss weight (set to 0.0 for CLS-only experiment)
 
 # Data augmentation (simplified for speed)
 use_multi_crop: false  # Use simple single-crop transform
 use_local_crops: false  # Disable local crops (major speedup)
+# DIAGNOSTIC Step 3: Set use_minimal_aug: true for minimal augmentation (resize + flip only, no crop/blur)
+use_minimal_aug: false  # Minimal augmentation for debugging (resize + flip only)
 
 # Teacher feature caching (optional, major speedup)
 cache_teacher_features: false  # Set to true to cache teacher features

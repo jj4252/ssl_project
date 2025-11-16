@@ -106,6 +106,24 @@ class SimpleTransform:
         return self.transform(image)
 
 
+class MinimalTransform:
+    """
+    Minimal augmentation for debugging (Step 3 diagnostic)
+    Only resize, horizontal flip, and normalize - no random crop or blur
+    """
+    def __init__(self, image_size=96):
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),  # Only flip
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+    
+    def __call__(self, image):
+        return self.transform(image)
+
+
 class EvalTransform:
     """Simple transform for evaluation (no augmentation)"""
     def __init__(self, image_size=96):
