@@ -1,0 +1,39 @@
+# MoCo-v3 Training Config
+# Contrastive learning with Vision Transformer (no teacher, no KD)
+
+# Training mode
+training_mode: "moco_v3"
+
+# Training hyperparameters
+batch_size: 256
+num_epochs: 100
+learning_rate: 0.0005  # 5e-4
+weight_decay: 0.05
+warmup_epochs: 10
+min_lr: 1e-6
+
+# MoCo-v3 specific settings
+moco:
+  proj_dim: 256           # Projection head output dimension
+  queue_size: 65536       # Number of negative keys in queue
+  momentum: 0.99          # EMA momentum for key encoder
+  temperature: 0.2        # InfoNCE temperature
+
+# Data augmentation (MoCo-v3 style)
+# Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale
+use_moco_aug: true  # Use MoCo-v3 style augmentations
+
+# Optimization settings
+compile_student: true   # Compile encoder_q (never compile encoder_k)
+use_fused_adamw: true   # Use fused AdamW optimizer
+
+# DataLoader settings
+num_workers: 4
+persistent_workers: false
+prefetch_factor: 2
+pin_memory: true
+
+# Checkpointing
+checkpoint_dir: "/scratch/$USER/Nov_14_distill/checkpoints_moco"
+save_every: 0  # Save checkpoint only at end of epoch (0 = disable step-based saving)
+
