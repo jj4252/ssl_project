@@ -296,11 +296,106 @@ def extract_student_features(student, images, use_cls_token=True):
     return cls_embedding, patch_embeddings
 
 
+class DistillationLoss(nn.Module):
+    """
+    Knowledge distillation loss with learnable projections for dimension mismatch.
+    
+    Handles cases where teacher and student have different embedding dimensions
+    by using learnable linear projections.
+    """
+    def __init__(self, teacher_dim=768, student_dim=384, loss_weights=None):
+        """
+        Args:
+            teacher_dim: Teacher embedding dimension (default: 768 for DINOv2 ViT-B)
+            student_dim: Student embedding dimension (default: 384 for ViT-S)
+            loss_weights: Dict with 'cls' and 'patch' weights
+        """
+        super().__init__()
+        self.teacher_dim = teacher_dim
+        self.student_dim = student_dim
+        self.loss_weights = loss_weights if loss_weights else {'cls': 1.0, 'patch': 0.5}
+        
+        # Learnable projection layers (only needed if dimensions differ)
+        if teacher_dim != student_dim:
+            self.teacher_proj_cls = nn.Linear(teacher_dim, student_dim, bias=False)
+            self.teacher_proj_patch = nn.Linear(teacher_dim, student_dim, bias=False)
+            # Initialize projections with Xavier uniform (standard for linear layers)
+            # This allows the projection to learn the optimal mapping
+            nn.init.xavier_uniform_(self.teacher_proj_cls.weight)
+            nn.init.xavier_uniform_(self.teacher_proj_patch.weight)
+        else:
+            self.teacher_proj_cls = None
+            self.teacher_proj_patch = None
+    
+    def forward(self, student_cls, student_patches, teacher_cls, teacher_patches):
+        """
+        Compute distillation loss.
+        
+        Args:
+            student_cls: Student CLS embedding [B, D_s]
+            student_patches: Student patch embeddings [B, N_s, D_s]
+            teacher_cls: Teacher CLS embedding [B, D_t]
+            teacher_patches: Teacher patch embeddings [B, N_t, D_t]
+        
+        Returns:
+            Total loss and component losses dict
+        """
+        # CLS token loss
+        if self.teacher_proj_cls is not None:
+            # Project teacher to student dimension
+            teacher_cls_proj = self.teacher_proj_cls(teacher_cls)  # [B, D_s]
+            teacher_cls_proj = F.normalize(teacher_cls_proj, dim=-1)
+            student_cls_norm = F.normalize(student_cls, dim=-1)
+            loss_cls = F.mse_loss(student_cls_norm, teacher_cls_proj)
+        else:
+            # Same dimensions: direct MSE
+            student_cls_norm = F.normalize(student_cls, dim=-1)
+            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+            loss_cls = F.mse_loss(student_cls_norm, teacher_cls_norm)
+        
+        # Patch embeddings loss
+        B_s, N_s, D_s = student_patches.shape
+        B_t, N_t, D_t = teacher_patches.shape
+        
+        # Handle patch number mismatch first
+        if N_s != N_t:
+            if N_s < N_t:
+                teacher_patches = teacher_patches[:, :N_s, :]  # Truncate teacher
+            else:
+                student_patches = student_patches[:, :N_t, :]  # Truncate student
+        
+        # Handle dimension mismatch
+        if self.teacher_proj_patch is not None:
+            # Project teacher patches to student dimension
+            teacher_patches_proj = self.teacher_proj_patch(teacher_patches)  # [B, N, D_s]
+            teacher_patches_proj = F.normalize(teacher_patches_proj, dim=-1)
+            student_patches_norm = F.normalize(student_patches, dim=-1)
+            loss_patch = F.mse_loss(student_patches_norm, teacher_patches_proj)
+        else:
+            # Same dimensions: direct MSE
+            student_patches_norm = F.normalize(student_patches, dim=-1)
+            teacher_patches_norm = F.normalize(teacher_patches, dim=-1)
+            loss_patch = F.mse_loss(student_patches_norm, teacher_patches_norm)
+        
+        # Weighted combination
+        total_loss = self.loss_weights['cls'] * loss_cls + self.loss_weights['patch'] * loss_patch
+        
+        return total_loss, {
+            'total': total_loss.item(),
+            'cls': loss_cls.item(),
+            'patch': loss_patch.item()
+        }
+
+
 def compute_distillation_loss(student_cls, student_patches, 
                              teacher_cls, teacher_patches,
-                             loss_weights=None):
+                             loss_weights=None,
+                             distillation_loss_module=None):
     """
-    Compute distillation loss between student and teacher embeddings
+    Compute distillation loss between student and teacher embeddings.
+    
+    This is a wrapper function that uses DistillationLoss module if provided,
+    otherwise falls back to simple computation (for backward compatibility).
     
     Args:
         student_cls: Student CLS embedding [B, D_s]
@@ -308,41 +403,40 @@ def compute_distillation_loss(student_cls, student_patches,
         teacher_cls: Teacher CLS embedding [B, D_t]
         teacher_patches: Teacher patch embeddings [B, N_t, D_t]
         loss_weights: Dict with 'cls' and 'patch' weights
+        distillation_loss_module: DistillationLoss module (if None, uses simple computation)
     
     Returns:
         Total loss and component losses
     """
+    if distillation_loss_module is not None:
+        return distillation_loss_module(student_cls, student_patches, teacher_cls, teacher_patches)
+    
+    # Fallback: simple computation (for backward compatibility)
     if loss_weights is None:
         loss_weights = {'cls': 1.0, 'patch': 0.5}
     
     # CLS token loss
     if student_cls.shape[-1] == teacher_cls.shape[-1]:
-        loss_cls = F.mse_loss(student_cls, teacher_cls)
+        student_cls_norm = F.normalize(student_cls, dim=-1)
+        teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+        loss_cls = F.mse_loss(student_cls_norm, teacher_cls_norm)
     else:
-        # Different dimensions: project larger embedding to match smaller one
-        # Since both are L2-normalized, we project and then compute MSE
-        # This preserves semantic information better than squared norm loss
+        # Different dimensions: use simple projection (mean pooling)
         D_s = student_cls.shape[-1]
         D_t = teacher_cls.shape[-1]
-        
         if D_s < D_t:
-            # Student smaller (e.g., 384): project teacher (768) down to 384
-            # For 768 -> 384: reshape [B, 384, 2] and mean pool -> [B, 384]
             ratio = D_t // D_s
             if D_t % D_s == 0:
-                # Perfect division (e.g., 768/384 = 2)
                 teacher_proj = teacher_cls.view(teacher_cls.shape[0], D_s, ratio).mean(dim=-1)
             else:
-                # Not perfect: use adaptive approach
-                # Take first D_s dimensions and average remaining
-                teacher_proj = teacher_cls[:, :D_s]  # Take first D_s dims
+                teacher_proj = teacher_cls[:, :D_s]
                 if D_t > D_s:
-                    # Average remaining dimensions and add
                     remaining = teacher_cls[:, D_s:].view(teacher_cls.shape[0], -1, D_s).mean(dim=1)
                     teacher_proj = (teacher_proj + remaining) / 2
-            loss_cls = F.mse_loss(student_cls, teacher_proj)
+            student_cls_norm = F.normalize(student_cls, dim=-1)
+            teacher_proj_norm = F.normalize(teacher_proj, dim=-1)
+            loss_cls = F.mse_loss(student_cls_norm, teacher_proj_norm)
         else:
-            # Teacher smaller: project student down to teacher dimension
             ratio = D_s // D_t
             if D_s % D_t == 0:
                 student_proj = student_cls.view(student_cls.shape[0], D_t, ratio).mean(dim=-1)
@@ -351,50 +445,50 @@ def compute_distillation_loss(student_cls, student_patches,
                 if D_s > D_t:
                     remaining = student_cls[:, D_t:].view(student_cls.shape[0], -1, D_t).mean(dim=1)
                     student_proj = (student_proj + remaining) / 2
-            loss_cls = F.mse_loss(student_proj, teacher_cls)
+            student_proj_norm = F.normalize(student_proj, dim=-1)
+            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+            loss_cls = F.mse_loss(student_proj_norm, teacher_cls_norm)
     
     # Patch embeddings loss
     B_s, N_s, D_s = student_patches.shape
     B_t, N_t, D_t = teacher_patches.shape
     
-    if N_s == N_t and D_s == D_t:
-        loss_patch = F.mse_loss(student_patches, teacher_patches)
-    elif D_s == D_t:
+    if N_s != N_t:
         if N_s < N_t:
             teacher_patches = teacher_patches[:, :N_s, :]
         else:
             student_patches = student_patches[:, :N_t, :]
-        loss_patch = F.mse_loss(student_patches, teacher_patches)
+    
+    if D_s == D_t:
+        student_patches_norm = F.normalize(student_patches, dim=-1)
+        teacher_patches_norm = F.normalize(teacher_patches, dim=-1)
+        loss_patch = F.mse_loss(student_patches_norm, teacher_patches_norm)
     else:
-        # Different number of patches or different dimensions: pool first, then handle dim mismatch
-        student_pooled = student_patches.mean(dim=1)  # [B, D_s]
-        teacher_pooled = teacher_patches.mean(dim=1)  # [B, D_t]
-        if D_s == D_t:
-            loss_patch = F.mse_loss(student_pooled, teacher_pooled)
-        else:
-            # Different dimensions: project larger to match smaller (same as CLS loss)
-            if D_s < D_t:
-                # Student smaller: project teacher down
-                ratio = D_t // D_s
-                if D_t % D_s == 0:
-                    teacher_proj = teacher_pooled.view(teacher_pooled.shape[0], D_s, ratio).mean(dim=-1)
-                else:
-                    teacher_proj = teacher_pooled[:, :D_s]
-                    if D_t > D_s:
-                        remaining = teacher_pooled[:, D_s:].view(teacher_pooled.shape[0], -1, D_s).mean(dim=1)
-                        teacher_proj = (teacher_proj + remaining) / 2
-                loss_patch = F.mse_loss(student_pooled, teacher_proj)
+        # Different dimensions: use simple projection
+        if D_s < D_t:
+            ratio = D_t // D_s
+            if D_t % D_s == 0:
+                teacher_proj = teacher_patches.view(teacher_patches.shape[0], teacher_patches.shape[1], D_s, ratio).mean(dim=-1)
             else:
-                # Teacher smaller: project student down
-                ratio = D_s // D_t
-                if D_s % D_t == 0:
-                    student_proj = student_pooled.view(student_pooled.shape[0], D_t, ratio).mean(dim=-1)
-                else:
-                    student_proj = student_pooled[:, :D_t]
-                    if D_s > D_t:
-                        remaining = student_pooled[:, D_t:].view(student_pooled.shape[0], -1, D_t).mean(dim=1)
-                        student_proj = (student_proj + remaining) / 2
-                loss_patch = F.mse_loss(student_proj, teacher_pooled)
+                teacher_proj = teacher_patches[:, :, :D_s]
+                if D_t > D_s:
+                    remaining = teacher_patches[:, :, D_s:].view(teacher_patches.shape[0], teacher_patches.shape[1], -1, D_s).mean(dim=2)
+                    teacher_proj = (teacher_proj + remaining) / 2
+            student_patches_norm = F.normalize(student_patches, dim=-1)
+            teacher_proj_norm = F.normalize(teacher_proj, dim=-1)
+            loss_patch = F.mse_loss(student_patches_norm, teacher_proj_norm)
+        else:
+            ratio = D_s // D_t
+            if D_s % D_t == 0:
+                student_proj = student_patches.view(student_patches.shape[0], student_patches.shape[1], D_t, ratio).mean(dim=-1)
+            else:
+                student_proj = student_patches[:, :, :D_t]
+                if D_s > D_t:
+                    remaining = student_patches[:, :, D_t:].view(student_patches.shape[0], student_patches.shape[1], -1, D_t).mean(dim=2)
+                    student_proj = (student_proj + remaining) / 2
+            student_proj_norm = F.normalize(student_proj, dim=-1)
+            teacher_patches_norm = F.normalize(teacher_patches, dim=-1)
+            loss_patch = F.mse_loss(student_proj_norm, teacher_patches_norm)
     
     # Weighted combination
     total_loss = loss_weights['cls'] * loss_cls + loss_weights['patch'] * loss_patch
@@ -411,7 +505,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 use_cls_token=True, use_multi_crop=False,
                 max_steps_per_epoch=None, cache_teacher_features=False,
                 teacher_feature_dir=None, save_every=0, global_step=0,
-                checkpoint_dir=None):
+                checkpoint_dir=None, distillation_loss_module=None):
     """
     Train one epoch with optimizations
     
@@ -513,7 +607,8 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     loss, metrics = compute_distillation_loss(
                         student_cls, student_patches,
                         teacher_cls, teacher_patches,
-                        loss_weights=loss_weights
+                        loss_weights=loss_weights,
+                        distillation_loss_module=distillation_loss_module
                     )
             else:
                 with autocast():
@@ -553,7 +648,8 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
             loss, metrics = compute_distillation_loss(
                 student_cls, student_patches,
                 teacher_cls, teacher_patches,
-                loss_weights=loss_weights
+                loss_weights=loss_weights,
+                distillation_loss_module=distillation_loss_module
             )
         
         gpu_time = time.time() - gpu_start
@@ -661,9 +757,44 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         print("✓ Student model compiled successfully")
         print("  ⚠️  Teacher is NOT compiled (frozen, no benefit)")
     
-    # Build optimizer and scheduler
-    optimizer = build_optimizer(student, lr=lr, weight_decay=weight_decay,
-                               fused=use_fused_adamw)
+    # Create distillation loss module with learnable projections
+    # Teacher (DINOv2 ViT-B): 768 dims, Student (ViT-S): 384 dims
+    distillation_loss_module = DistillationLoss(
+        teacher_dim=768,
+        student_dim=384,
+        loss_weights=loss_weights
+    ).to(device)
+    print("✓ Created DistillationLoss module with learnable projections (768→384)")
+    
+    # Build optimizer: include both student and projection layers
+    # Combine student parameters and distillation loss projection parameters
+    # Group parameters: weight decay for non-bias/norm, no weight decay for bias/norm
+    params_with_wd = []
+    params_without_wd = []
+    for name, param in student.named_parameters():
+        if any(nd in name for nd in ["bias", "norm", "ln"]):
+            params_without_wd.append(param)
+        else:
+            params_with_wd.append(param)
+    for name, param in distillation_loss_module.named_parameters():
+        if any(nd in name for nd in ["bias", "norm", "ln"]):
+            params_without_wd.append(param)
+        else:
+            params_with_wd.append(param)
+    
+    param_groups = [
+        {"params": params_with_wd, "weight_decay": weight_decay},
+        {"params": params_without_wd, "weight_decay": 0.0},
+    ]
+    
+    # Use fused AdamW for better performance (requires CUDA)
+    if use_fused_adamw and device.type == 'cuda':
+        try:
+            optimizer = torch.optim.AdamW(param_groups, lr=lr, fused=True)
+        except TypeError:
+            optimizer = torch.optim.AdamW(param_groups, lr=lr, fused=False)
+    else:
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, fused=False)
     scheduler = build_scheduler(optimizer, num_epochs=num_epochs,
                                warmup_epochs=warmup_epochs)
     
@@ -675,6 +806,9 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
         student.load_state_dict(checkpoint['student'])
+        if 'distillation_loss' in checkpoint:
+            distillation_loss_module.load_state_dict(checkpoint['distillation_loss'])
+            print("✓ Loaded distillation loss module state")
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         scaler.load_state_dict(checkpoint['scaler'])
@@ -705,7 +839,8 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             cache_teacher_features=cache_teacher_features,
             teacher_feature_dir=teacher_feature_dir,
             save_every=save_every, global_step=global_step,
-            checkpoint_dir=checkpoint_dir
+            checkpoint_dir=checkpoint_dir,
+            distillation_loss_module=distillation_loss_module
         )
         
         print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.4f} "
@@ -716,6 +851,7 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint = {
                 'student': student.state_dict(),
+                'distillation_loss': distillation_loss_module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
