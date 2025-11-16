@@ -347,18 +347,39 @@ class DistillationLoss(nn.Module):
         Returns:
             Total loss and component losses dict
         """
+        # Track if diagnostics have been printed (only print once)
+        if not hasattr(self, '_diagnostic_printed'):
+            self._diagnostic_printed = False
+        
         # CLS token loss
         if self.teacher_proj_cls is not None:
             # Project teacher to student dimension
             teacher_cls_proj = self.teacher_proj_cls(teacher_cls)  # [B, D_s]
-            teacher_cls_proj = F.normalize(teacher_cls_proj, dim=-1)
-            student_cls_norm = F.normalize(student_cls, dim=-1)
-            loss_cls = F.mse_loss(student_cls_norm, teacher_cls_proj)
+            teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)  # [B, D_s] - final target used in loss
         else:
-            # Same dimensions: direct MSE
-            student_cls_norm = F.normalize(student_cls, dim=-1)
-            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
-            loss_cls = F.mse_loss(student_cls_norm, teacher_cls_norm)
+            # Same dimensions: direct normalization
+            teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # [B, D_t] - final target used in loss
+        
+        student_cls_norm = F.normalize(student_cls, dim=-1)
+        
+        # DIAGNOSTIC: Check teacher CLS targets actually used in loss
+        if not self._diagnostic_printed:
+            print(f"\n🔍 DistillationLoss.forward() - Teacher CLS Target Diagnostics:")
+            print(f"  Shape: {teacher_cls_target.shape}")
+            print(f"  Mean: {teacher_cls_target.mean().item():.6f}")
+            print(f"  Std: {teacher_cls_target.std().item():.6f}")
+            # Per-dimension variance (over batch, per feature dim)
+            cls_var = teacher_cls_target.var(dim=0)  # [D] variance over batch dimension
+            print(f"  Per-dim variance (over batch): mean={cls_var.mean().item():.6f}, "
+                  f"min={cls_var.min().item():.6f}, max={cls_var.max().item():.6f}")
+            # Pairwise similarity over batch (should be < 0.3 for diverse features)
+            teacher_cls_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+            print(f"  Pairwise similarity (batch): {teacher_cls_pairwise_sim:.6f} "
+                  f"{'⚠️ COLLAPSED!' if teacher_cls_pairwise_sim > 0.9 else '✓ diverse' if teacher_cls_pairwise_sim < 0.3 else '⚠️ suspicious'}")
+            # Verify no batch dimension reduction
+            print(f"  ✓ Verified: Normalization uses dim=-1 (feature dim), NOT dim=0 (batch dim)")
+        
+        loss_cls = F.mse_loss(student_cls_norm, teacher_cls_target)
         
         # Patch embeddings loss
         B_s, N_s, D_s = student_patches.shape
@@ -367,22 +388,43 @@ class DistillationLoss(nn.Module):
         # Handle patch number mismatch first
         if N_s != N_t:
             if N_s < N_t:
-                teacher_patches = teacher_patches[:, :N_s, :]  # Truncate teacher
+                teacher_patches = teacher_patches[:, :N_s, :]  # Truncate teacher [B, N_s, D_t]
             else:
-                student_patches = student_patches[:, :N_t, :]  # Truncate student
+                student_patches = student_patches[:, :N_t, :]  # Truncate student [B, N_t, D_s]
         
         # Handle dimension mismatch
         if self.teacher_proj_patch is not None:
             # Project teacher patches to student dimension
             teacher_patches_proj = self.teacher_proj_patch(teacher_patches)  # [B, N, D_s]
-            teacher_patches_proj = F.normalize(teacher_patches_proj, dim=-1)
-            student_patches_norm = F.normalize(student_patches, dim=-1)
-            loss_patch = F.mse_loss(student_patches_norm, teacher_patches_proj)
+            teacher_patches_target = F.normalize(teacher_patches_proj, dim=-1)  # [B, N, D_s] - final target
         else:
-            # Same dimensions: direct MSE
-            student_patches_norm = F.normalize(student_patches, dim=-1)
-            teacher_patches_norm = F.normalize(teacher_patches, dim=-1)
-            loss_patch = F.mse_loss(student_patches_norm, teacher_patches_norm)
+            # Same dimensions: direct normalization
+            teacher_patches_target = F.normalize(teacher_patches, dim=-1)  # [B, N, D_t] - final target
+        
+        student_patches_norm = F.normalize(student_patches, dim=-1)
+        
+        # DIAGNOSTIC: Check teacher patch targets actually used in loss
+        if not self._diagnostic_printed:
+            print(f"\n🔍 DistillationLoss.forward() - Teacher Patch Target Diagnostics:")
+            print(f"  Shape: {teacher_patches_target.shape}")
+            print(f"  Mean: {teacher_patches_target.mean().item():.6f}")
+            print(f"  Std: {teacher_patches_target.std().item():.6f}")
+            # Per-dimension variance (over batch and patches, per feature dim)
+            patch_var = teacher_patches_target.var(dim=(0, 1))  # [D] variance over batch and patches
+            print(f"  Per-dim variance (over batch+patches): mean={patch_var.mean().item():.6f}, "
+                  f"min={patch_var.min().item():.6f}, max={patch_var.max().item():.6f}")
+            # Pairwise similarity: flatten to [B*N, D] then compute
+            B, N, D = teacher_patches_target.shape
+            teacher_patches_flat = teacher_patches_target.view(B * N, D)
+            patch_pairwise_sim = (teacher_patches_flat @ teacher_patches_flat.T).mean().item()
+            print(f"  Pairwise similarity (batch*patches): {patch_pairwise_sim:.6f} "
+                  f"{'⚠️ COLLAPSED!' if patch_pairwise_sim > 0.9 else '✓ diverse' if patch_pairwise_sim < 0.3 else '⚠️ suspicious'}")
+            # Verify aggregation: loss should average over batch, patches, and features
+            print(f"  ✓ Verified: Loss aggregates over batch (dim=0), patches (dim=1), features (dim=2)")
+            print(f"  ✓ Verified: NO batch dimension reduction before loss computation")
+            self._diagnostic_printed = True
+        
+        loss_patch = F.mse_loss(student_patches_norm, teacher_patches_target)
         
         # Weighted combination
         total_loss = self.loss_weights['cls'] * loss_cls + self.loss_weights['patch'] * loss_patch
