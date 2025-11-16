@@ -378,8 +378,13 @@ class DistillationLoss(nn.Module):
                   f"{'⚠️ COLLAPSED!' if teacher_cls_pairwise_sim > 0.9 else '✓ diverse' if teacher_cls_pairwise_sim < 0.3 else '⚠️ suspicious'}")
             # Verify no batch dimension reduction
             print(f"  ✓ Verified: Normalization uses dim=-1 (feature dim), NOT dim=0 (batch dim)")
+            print(f"  ✓ Using cosine similarity loss (1 - cosine_sim) instead of MSE")
         
-        loss_cls = F.mse_loss(student_cls_norm, teacher_cls_target)
+        # Cosine similarity loss: compute per-sample cosine similarity, then average
+        # This ensures student must match each teacher target individually
+        # cosine_sim = (s · t) for normalized vectors, shape: [B]
+        cosine_sim_cls = (student_cls_norm * teacher_cls_target).sum(dim=-1)  # [B] per-sample cosine similarity
+        loss_cls = (1 - cosine_sim_cls).mean()  # Average over batch only
         
         # Patch embeddings loss
         B_s, N_s, D_s = student_patches.shape
@@ -422,9 +427,13 @@ class DistillationLoss(nn.Module):
             # Verify aggregation: loss should average over batch, patches, and features
             print(f"  ✓ Verified: Loss aggregates over batch (dim=0), patches (dim=1), features (dim=2)")
             print(f"  ✓ Verified: NO batch dimension reduction before loss computation")
+            print(f"  ✓ Using cosine similarity loss (1 - cosine_sim) instead of MSE")
             self._diagnostic_printed = True
         
-        loss_patch = F.mse_loss(student_patches_norm, teacher_patches_target)
+        # Cosine similarity loss for patches: compute per-sample, per-patch cosine similarity
+        # cosine_sim = (s · t) for normalized vectors, shape: [B, N]
+        cosine_sim_patch = (student_patches_norm * teacher_patches_target).sum(dim=-1)  # [B, N] per-sample, per-patch
+        loss_patch = (1 - cosine_sim_patch).mean()  # Average over batch and patches
         
         # Weighted combination
         total_loss = self.loss_weights['cls'] * loss_cls + self.loss_weights['patch'] * loss_patch
