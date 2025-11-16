@@ -334,7 +334,15 @@ def main():
     # Evaluate each checkpoint
     results = {}
     
-    for checkpoint_name, checkpoint_path in sorted(checkpoints.items()):
+    # Sort checkpoints: handle mixed int/str keys by converting to comparable format
+    def sort_key(item):
+        name, path = item
+        if isinstance(name, int):
+            return (0, name)  # Int keys come first, sorted by value
+        else:
+            return (1, str(name))  # String keys come after, sorted alphabetically
+    
+    for checkpoint_name, checkpoint_path in sorted(checkpoints.items(), key=sort_key):
         print(f"\n{'='*60}")
         print(f"Evaluating checkpoint: {checkpoint_name} ({checkpoint_path.name})")
         print(f"{'='*60}")
