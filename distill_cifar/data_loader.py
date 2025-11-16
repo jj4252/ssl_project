@@ -18,7 +18,7 @@ from torchvision.transforms import InterpolationMode
 
 class CIFARDataset(Dataset):
     """CIFAR dataset for pretraining (unlabeled, using only images)"""
-    def __init__(self, dataset_name="cifar10", root="./data", train=True, transform=None, max_samples=None):
+    def __init__(self, dataset_name="cifar10", root="./data", train=True, transform=None, max_samples=None, return_two_views=False):
         """
         Args:
             dataset_name: "cifar10" or "cifar100"
@@ -26,6 +26,7 @@ class CIFARDataset(Dataset):
             train: Use training split (True) or test split (False)
             transform: Transform to apply to images
             max_samples: Maximum number of samples to use (None = use all)
+            return_two_views: If True, return two augmented views for SSL (Barlow Twins)
         """
         print(f"Loading {dataset_name.upper()} dataset...")
         
@@ -44,7 +45,10 @@ class CIFARDataset(Dataset):
             self.dataset = Subset(self.dataset, indices)
         
         self.transform = transform
+        self.return_two_views = return_two_views
         print(f"  Loaded {len(self.dataset):,} images")
+        if return_two_views:
+            print(f"  ✓ Returning two views per image for SSL (Barlow Twins)")
     
     def __getitem__(self, idx):
         # Get image (ignore label for pretraining)
@@ -54,10 +58,18 @@ class CIFARDataset(Dataset):
             image, _ = self.dataset[idx]
         
         if self.transform:
-            views = self.transform(image)  # Multi-crop returns list
+            if self.return_two_views:
+                # Return two augmented views for SSL
+                view1 = self.transform(image)
+                view2 = self.transform(image)  # Apply transform again (stochastic)
+                return view1, view2
+            else:
+                views = self.transform(image)  # Multi-crop returns list
+                return views
         else:
-            views = image
-        return views
+            if self.return_two_views:
+                return image, image  # Return same image twice if no transform
+            return image
     
     def __len__(self):
         return len(self.dataset)
@@ -107,13 +119,19 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
             scale=(0.2, 1.0)
         )
     
+    # Check if SSL is enabled (for Barlow Twins, need two views)
+    ssl_config = train_config.get('ssl', {})
+    use_ssl = ssl_config.get('enabled', False)
+    return_two_views = use_ssl  # Return two views if SSL is enabled
+    
     # Create dataset
     dataset = CIFARDataset(
         dataset_name=dataset_name,
         root=dataset_root,
         train=True,
         transform=transform,
-        max_samples=max_samples
+        max_samples=max_samples,
+        return_two_views=return_two_views
     )
     
     print(f"✓ Using {dataset_name.upper()} dataset: {len(dataset):,} images")
