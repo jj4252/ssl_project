@@ -1,0 +1,33 @@
+# Data loading configuration (optimized for fixed shard subset - testing if random sampling degrades performance)
+
+dataset_name: "tsbpp/fall2025_deeplearning"
+image_size: 96  # Match original image size (96x96) - student operates at native resolution
+num_workers: 2  # Reduced to prevent OOM
+persistent_workers: false  # Must be false
+prefetch_factor: 1  # Reduced to prevent OOM
+pin_memory: true
+
+# Cache configuration (2-stage pipeline)
+# Auto-detection: If cache exists, it will be used automatically
+# Set to false to explicitly disable cached mode even if cache exists
+use_cached_tensors: null  # null = auto-detect, true = force enable, false = force disable
+cache_root: "/scratch/jj4252/Nov_14_distill/cache_images"  # Root directory for cached tensors
+cache_image_size: 96  # Match original image size (96x96) - no need to cache larger
+cache_dtype: "float32"  # Data type for cached tensors (float32 or float16)
+cache_shard_size: 2048  # Number of samples per shard file
+
+# Fixed shard-level subset (for testing if random sampling degrades performance)
+# Uses a fixed set of shard files (first N shards) for all epochs.
+# This allows comparison with random shard sampling to see if randomness degrades performance.
+fixed_shards: 25  # Number of fixed shard files to use (~50K images with 2048 per shard)
+
+# Legacy: samples_per_epoch (deprecated - use fixed_shards instead)
+# samples_per_epoch: 50000  # Will be converted to fixed_shards automatically
+
+# Subset limits for testing (optional - usually not needed with fixed shards)
+# max_shards: null  # Limit to first N shard files (for testing)
+# max_samples: null  # Limit by total samples (for testing)
+
+# Legacy compatibility (will be removed)
+use_cached: false  # Deprecated: use use_cached_tensors instead
+cache_dir: "/scratch/jj4252/Nov_14_distill/cache_images"  # Deprecated: use cache_root instead

@@ -1,0 +1,15 @@
+# Knowledge Distillation Model Config
+
+# Teacher model (frozen, pretrained)
+teacher_name: "dinov2_vitb14"  # DINOv2 ViT-B/14 from torch.hub
+teacher_freeze: true  # Always frozen for KD
+
+# Student model (trainable, random init)
+student_name: "vit_small_patch16_224"  # ViT-S/16 from timm (~48M params) - will be patched to 96x96
+student_img_size: 96  # Image size for student (matches original 96x96 images) - will override model default
+student_patch_size: 16
+
+# Model architecture
+use_cls_token: true  # Use CLS token (true) or mean-pool patches (false)
+drop_path_rate: 0.1
+
