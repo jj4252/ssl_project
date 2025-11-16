@@ -350,11 +350,35 @@ def main():
         # Load checkpoint
         try:
             state_dict = load_checkpoint(checkpoint_path, device)
-            student.load_state_dict(state_dict)
+            
+            # Debug: print checkpoint keys
+            if checkpoint_name == list(checkpoints.keys())[0]:  # Only for first checkpoint
+                print(f"  Debug: Checkpoint keys (first 10): {list(state_dict.keys())[:10]}")
+                print(f"  Debug: Model keys (first 10): {list(student.state_dict().keys())[:10]}")
+            
+            # Try strict loading first
+            try:
+                student.load_state_dict(state_dict, strict=True)
+                print(f"✓ Loaded checkpoint: {checkpoint_name} (strict mode)")
+            except RuntimeError as e:
+                # If strict loading fails, try with strict=False and report missing/unexpected keys
+                print(f"  ⚠️  Strict loading failed, trying non-strict mode...")
+                print(f"  Error: {str(e)[:200]}")  # Print first part of error
+                missing_keys, unexpected_keys = student.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    print(f"  ⚠️  Missing {len(missing_keys)} keys (first 5: {missing_keys[:5]})")
+                if unexpected_keys:
+                    print(f"  ⚠️  Unexpected {len(unexpected_keys)} keys (first 5: {unexpected_keys[:5]})")
+                if not missing_keys and not unexpected_keys:
+                    print(f"  ✓ All keys matched (non-strict mode)")
+                else:
+                    print(f"  ⚠️  Loaded with mismatched keys - model may not work correctly")
+            
             student.eval()
-            print(f"✓ Loaded checkpoint: {checkpoint_name}")
         except Exception as e:
             print(f"❌ Error loading checkpoint {checkpoint_name}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
         
         # Extract training features
