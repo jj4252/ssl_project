@@ -18,14 +18,14 @@ from torchvision.transforms import InterpolationMode
 
 class CIFARDataset(Dataset):
     """CIFAR dataset for pretraining (unlabeled, using only images)"""
-    def __init__(self, dataset_name="cifar10", root="./data", train=True, transform=None, max_samples=20000):
+    def __init__(self, dataset_name="cifar10", root="./data", train=True, transform=None, max_samples=None):
         """
         Args:
             dataset_name: "cifar10" or "cifar100"
             root: Root directory for CIFAR data
             train: Use training split (True) or test split (False)
             transform: Transform to apply to images
-            max_samples: Maximum number of samples to use (default: 20000)
+            max_samples: Maximum number of samples to use (None = use all)
         """
         print(f"Loading {dataset_name.upper()} dataset...")
         
@@ -37,7 +37,7 @@ class CIFARDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}. Use 'cifar10' or 'cifar100'")
         
-        # Limit to max_samples
+        # Limit to max_samples if specified
         if max_samples is not None and len(self.dataset) > max_samples:
             print(f"  Limiting dataset to {max_samples:,} samples (from {len(self.dataset):,})")
             indices = list(range(max_samples))
@@ -79,10 +79,10 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     # Get dataset configuration
     dataset_name = data_config.get('dataset_name', 'cifar10')
     dataset_root = data_config.get('dataset_root', './data')
-    max_samples = data_config.get('max_samples', 20000)
+    max_samples = data_config.get('max_samples', None)  # None = use full dataset
     
-    # Get training image size
-    image_size = data_config.get('image_size', 224)
+    # Get training image size (CIFAR10 is 32x32, will be upscaled to image_size)
+    image_size = data_config.get('image_size', 96)  # Match student model size
     use_multi_crop = train_config.get('use_multi_crop', False)
     use_local_crops = train_config.get('use_local_crops', False)
     

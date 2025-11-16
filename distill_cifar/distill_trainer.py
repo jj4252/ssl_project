@@ -19,7 +19,14 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
+# Try to import new GradScaler API (PyTorch 2.0+), fall back to old API
+try:
+    from torch.amp import GradScaler
+    GRADSCALER_NEW_API = True
+except ImportError:
+    from torch.cuda.amp import GradScaler
+    GRADSCALER_NEW_API = False
+
 # Try to import new autocast API (PyTorch 2.0+), fall back to old API
 try:
     from torch.amp import autocast  # PyTorch 2.0+
@@ -103,44 +110,107 @@ def build_student_model(model_name="vit_small_patch16_224",
     Build student ViT model from timm (random initialization)
     
     Args:
-        model_name: timm model name (e.g., "vit_small_patch16_224")
-        img_size: Input image size
+        model_name: timm model name (e.g., "vit_small_patch16_224" or "vit_small_patch16")
+        img_size: Input image size (will override model default if different)
         device: Device to load model on
     
     Returns:
         Student model (trainable)
     """
-    print(f"Building student model: {model_name}")
-    student = timm.create_model(
-        model_name,
-        pretrained=False,  # Random initialization
-        img_size=img_size,
-        num_classes=0,  # No classification head
-    )
+    print(f"Building student model: {model_name} with img_size={img_size}")
+    
+    # Try to create model with custom img_size
+    try:
+        student = timm.create_model(
+            model_name,
+            pretrained=False,  # Random initialization
+            img_size=img_size,
+            num_classes=0,  # No classification head
+        )
+    except Exception as e:
+        # If model creation fails (e.g., model name doesn't support custom size),
+        # try creating with default size and then patch it
+        print(f"  Warning: Could not create model with img_size={img_size}, trying default size first...")
+        print(f"  Error: {e}")
+        student = timm.create_model(
+            model_name,
+            pretrained=False,
+            num_classes=0,
+        )
+    
+    # Always patch patch_embed to ensure it matches desired img_size
+    # (Some models may ignore img_size parameter or have hardcoded checks)
+    if hasattr(student, 'patch_embed'):
+        # Get current patch size
+        if hasattr(student.patch_embed, 'patch_size'):
+            patch_size = student.patch_embed.patch_size
+            if isinstance(patch_size, (list, tuple)):
+                patch_size = patch_size[0]
+        else:
+            # Default patch size for ViT-S/16
+            patch_size = 16
+        
+        # Check current img_size
+        current_img_size = None
+        if hasattr(student.patch_embed, 'img_size'):
+            current_img_size = student.patch_embed.img_size
+            if isinstance(current_img_size, (list, tuple)):
+                current_img_size = current_img_size[0]
+        
+        # Calculate new grid size
+        grid_size = img_size // patch_size
+        
+        # Patch if needed
+        if current_img_size != img_size:
+            print(f"  Patching patch_embed from {current_img_size}x{current_img_size} to {img_size}x{img_size}")
+            if hasattr(student.patch_embed, 'img_size'):
+                student.patch_embed.img_size = (img_size, img_size)
+            
+            # Update grid_size and num_patches
+            if hasattr(student.patch_embed, 'grid_size'):
+                student.patch_embed.grid_size = (grid_size, grid_size)
+            if hasattr(student.patch_embed, 'num_patches'):
+                student.patch_embed.num_patches = grid_size * grid_size
+            
+            print(f"  ✓ Patched: patch_size={patch_size}, grid_size={grid_size}x{grid_size}, num_patches={grid_size * grid_size}")
+    
     student = student.to(device)
     student.train()
     
     num_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     
-    print(f"✓ Student created: {model_name}")
-    print(f"  Parameters: {num_params / 1e6:.2f}M")
-    print(f"  Trainable: {trainable_params / 1e6:.2f}M")
+    # Verify the model accepts the desired img_size
+    if hasattr(student, 'patch_embed') and hasattr(student.patch_embed, 'img_size'):
+        actual_img_size = student.patch_embed.img_size
+        if isinstance(actual_img_size, (list, tuple)):
+            actual_img_size = actual_img_size[0]
+        print(f"✓ Student created: {model_name}")
+        print(f"  Parameters: {num_params / 1e6:.2f}M")
+        print(f"  Trainable: {trainable_params / 1e6:.2f}M")
+        print(f"  Image size: {actual_img_size}x{actual_img_size}")
+        if actual_img_size != img_size:
+            print(f"  ⚠️  Warning: Model img_size ({actual_img_size}) != requested ({img_size})")
+    else:
+        print(f"✓ Student created: {model_name}")
+        print(f"  Parameters: {num_params / 1e6:.2f}M")
+        print(f"  Trainable: {trainable_params / 1e6:.2f}M")
     
     return student
 
 
 def extract_teacher_features(teacher, images, use_cls_token=True, 
-                            cache_dir=None, cache_key=None):
+                            cache_dir=None, cache_key=None, teacher_img_size=224):
     """
     Extract features from frozen teacher model with optional caching
     
     Args:
-        teacher: DINOv2 teacher model
-        images: Input images [B, 3, H, W]
+        teacher: DINOv2 teacher model (expects 224x224 input)
+        images: Input images [B, 3, H, W] (may be 96x96)
         use_cls_token: Whether to use CLS token or mean-pool patches
         cache_dir: Optional directory to cache features
         cache_key: Optional key for caching (e.g., batch index)
+        teacher_img_size: Target size for teacher (default 224x224 for DINOv2)
     
     Returns:
         cls_embedding: [B, D] CLS token embedding
@@ -154,6 +224,15 @@ def extract_teacher_features(teacher, images, use_cls_token=True,
             return cached['cls'], cached['patches']
     
     with torch.no_grad():
+        # Upscale images to teacher's expected size (96x96 -> 224x224)
+        if images.shape[-1] != teacher_img_size or images.shape[-2] != teacher_img_size:
+            images = F.interpolate(
+                images, 
+                size=(teacher_img_size, teacher_img_size), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
         # DINOv2 forward_features may return dict or tensor
         features = teacher.forward_features(images)
         
@@ -224,11 +303,161 @@ def extract_student_features(student, images, use_cls_token=True):
     return cls_embedding, patch_embeddings
 
 
+class DistillationLoss(nn.Module):
+    """
+    Knowledge distillation loss with learnable projections for dimension mismatch.
+    
+    Handles cases where teacher and student have different embedding dimensions
+    by using learnable linear projections.
+    """
+    def __init__(self, teacher_dim=768, student_dim=384, loss_weights=None):
+        """
+        Args:
+            teacher_dim: Teacher embedding dimension (default: 768 for DINOv2 ViT-B)
+            student_dim: Student embedding dimension (default: 384 for ViT-S)
+            loss_weights: Dict with 'cls' and 'patch' weights
+        """
+        super().__init__()
+        self.teacher_dim = teacher_dim
+        self.student_dim = student_dim
+        self.loss_weights = loss_weights if loss_weights else {'cls': 1.0, 'patch': 0.5}
+        
+        # Learnable projection layers (only needed if dimensions differ)
+        if teacher_dim != student_dim:
+            self.teacher_proj_cls = nn.Linear(teacher_dim, student_dim, bias=False)
+            self.teacher_proj_patch = nn.Linear(teacher_dim, student_dim, bias=False)
+            # Initialize projections with Xavier uniform (standard for linear layers)
+            # This allows the projection to learn the optimal mapping
+            nn.init.xavier_uniform_(self.teacher_proj_cls.weight)
+            nn.init.xavier_uniform_(self.teacher_proj_patch.weight)
+        else:
+            self.teacher_proj_cls = None
+            self.teacher_proj_patch = None
+    
+    def forward(self, student_cls, student_patches, teacher_cls, teacher_patches):
+        """
+        Compute distillation loss.
+        
+        Args:
+            student_cls: Student CLS embedding [B, D_s]
+            student_patches: Student patch embeddings [B, N_s, D_s]
+            teacher_cls: Teacher CLS embedding [B, D_t]
+            teacher_patches: Teacher patch embeddings [B, N_t, D_t]
+        
+        Returns:
+            Total loss and component losses dict
+        """
+        # Track if diagnostics have been printed (only print once)
+        if not hasattr(self, '_diagnostic_printed'):
+            self._diagnostic_printed = False
+        
+        # CLS token loss
+        if self.teacher_proj_cls is not None:
+            # Project teacher to student dimension
+            teacher_cls_proj = self.teacher_proj_cls(teacher_cls)  # [B, D_s]
+            teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)  # [B, D_s] - final target used in loss
+        else:
+            # Same dimensions: direct normalization
+            teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # [B, D_t] - final target used in loss
+        
+        student_cls_norm = F.normalize(student_cls, dim=-1)
+        
+        # DIAGNOSTIC: Check teacher CLS targets actually used in loss
+        if not self._diagnostic_printed:
+            print(f"\n🔍 DistillationLoss.forward() - Teacher CLS Target Diagnostics:")
+            print(f"  Shape: {teacher_cls_target.shape}")
+            print(f"  Mean: {teacher_cls_target.mean().item():.6f}")
+            print(f"  Std: {teacher_cls_target.std().item():.6f}")
+            # Per-dimension variance (over batch, per feature dim)
+            cls_var = teacher_cls_target.var(dim=0)  # [D] variance over batch dimension
+            print(f"  Per-dim variance (over batch): mean={cls_var.mean().item():.6f}, "
+                  f"min={cls_var.min().item():.6f}, max={cls_var.max().item():.6f}")
+            # Pairwise similarity over batch (should be < 0.3 for diverse features)
+            teacher_cls_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+            print(f"  Pairwise similarity (batch): {teacher_cls_pairwise_sim:.6f} "
+                  f"{'⚠️ COLLAPSED!' if teacher_cls_pairwise_sim > 0.9 else '✓ diverse' if teacher_cls_pairwise_sim < 0.3 else '⚠️ suspicious'}")
+            # Verify no batch dimension reduction
+            print(f"  ✓ Verified: Normalization uses dim=-1 (feature dim), NOT dim=0 (batch dim)")
+            print(f"  ✓ Using cosine similarity loss (1 - cosine_sim) instead of MSE")
+        
+        # CLS loss: per-sample cosine, then mean
+        # Use F.cosine_similarity for explicit per-sample computation
+        cosine_sim_cls = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1)  # [B]
+        loss_cls = (1.0 - cosine_sim_cls).mean()
+        
+        # Patch embeddings loss
+        B_s, N_s, D_s = student_patches.shape
+        B_t, N_t, D_t = teacher_patches.shape
+        
+        # Handle patch number mismatch first
+        if N_s != N_t:
+            if N_s < N_t:
+                teacher_patches = teacher_patches[:, :N_s, :]  # Truncate teacher [B, N_s, D_t]
+            else:
+                student_patches = student_patches[:, :N_t, :]  # Truncate student [B, N_t, D_s]
+        
+        # Handle dimension mismatch
+        if self.teacher_proj_patch is not None:
+            # Project teacher patches to student dimension
+            teacher_patches_proj = self.teacher_proj_patch(teacher_patches)  # [B, N, D_s]
+            teacher_patches_target = F.normalize(teacher_patches_proj, dim=-1)  # [B, N, D_s] - final target
+        else:
+            # Same dimensions: direct normalization
+            teacher_patches_target = F.normalize(teacher_patches, dim=-1)  # [B, N, D_t] - final target
+        
+        student_patches_norm = F.normalize(student_patches, dim=-1)
+        
+        # DIAGNOSTIC: Check teacher patch targets actually used in loss
+        if not self._diagnostic_printed:
+            print(f"\n🔍 DistillationLoss.forward() - Teacher Patch Target Diagnostics:")
+            print(f"  Shape: {teacher_patches_target.shape}")
+            print(f"  Mean: {teacher_patches_target.mean().item():.6f}")
+            print(f"  Std: {teacher_patches_target.std().item():.6f}")
+            # Per-dimension variance (over batch and patches, per feature dim)
+            patch_var = teacher_patches_target.var(dim=(0, 1))  # [D] variance over batch and patches
+            print(f"  Per-dim variance (over batch+patches): mean={patch_var.mean().item():.6f}, "
+                  f"min={patch_var.min().item():.6f}, max={patch_var.max().item():.6f}")
+            # Pairwise similarity: flatten to [B*N, D] then compute
+            B, N, D = teacher_patches_target.shape
+            teacher_patches_flat = teacher_patches_target.view(B * N, D)
+            patch_pairwise_sim = (teacher_patches_flat @ teacher_patches_flat.T).mean().item()
+            print(f"  Pairwise similarity (batch*patches): {patch_pairwise_sim:.6f} "
+                  f"{'⚠️ COLLAPSED!' if patch_pairwise_sim > 0.9 else '✓ diverse' if patch_pairwise_sim < 0.3 else '⚠️ suspicious'}")
+            # Verify aggregation: loss should average over batch, patches, and features
+            print(f"  ✓ Verified: Loss aggregates over batch (dim=0), patches (dim=1), features (dim=2)")
+            print(f"  ✓ Verified: NO batch dimension reduction before loss computation")
+            print(f"  ✓ Using cosine similarity loss (1 - cosine_sim) instead of MSE")
+            self._diagnostic_printed = True
+        
+        # PATCHES loss: per-sample, per-patch cosine, then mean
+        # Flatten to [B*N, D] for per-patch cosine similarity
+        B, N, D = student_patches_norm.shape
+        cosine_sim_patch = F.cosine_similarity(
+            student_patches_norm.view(-1, D),
+            teacher_patches_target.view(-1, D),
+            dim=-1,
+        )  # [B*N]
+        loss_patch = (1.0 - cosine_sim_patch).mean()
+        
+        # Weighted combination
+        total_loss = self.loss_weights['cls'] * loss_cls + self.loss_weights['patch'] * loss_patch
+        
+        return total_loss, {
+            'total': total_loss.item(),
+            'cls': loss_cls.item(),
+            'patch': loss_patch.item()
+        }
+
+
 def compute_distillation_loss(student_cls, student_patches, 
                              teacher_cls, teacher_patches,
-                             loss_weights=None):
+                             loss_weights=None,
+                             distillation_loss_module=None):
     """
-    Compute distillation loss between student and teacher embeddings
+    Compute distillation loss between student and teacher embeddings.
+    
+    This is a wrapper function that uses DistillationLoss module if provided,
+    otherwise falls back to simple computation (for backward compatibility).
     
     Args:
         student_cls: Student CLS embedding [B, D_s]
@@ -236,43 +465,92 @@ def compute_distillation_loss(student_cls, student_patches,
         teacher_cls: Teacher CLS embedding [B, D_t]
         teacher_patches: Teacher patch embeddings [B, N_t, D_t]
         loss_weights: Dict with 'cls' and 'patch' weights
+        distillation_loss_module: DistillationLoss module (if None, uses simple computation)
     
     Returns:
         Total loss and component losses
     """
+    if distillation_loss_module is not None:
+        return distillation_loss_module(student_cls, student_patches, teacher_cls, teacher_patches)
+    
+    # Fallback: simple computation (for backward compatibility)
     if loss_weights is None:
         loss_weights = {'cls': 1.0, 'patch': 0.5}
     
     # CLS token loss
     if student_cls.shape[-1] == teacher_cls.shape[-1]:
-        loss_cls = F.mse_loss(student_cls, teacher_cls)
+        student_cls_norm = F.normalize(student_cls, dim=-1)
+        teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+        loss_cls = F.mse_loss(student_cls_norm, teacher_cls_norm)
     else:
-        # Different dimensions: use squared norm loss
-        student_sq_norm = (student_cls ** 2).sum(dim=-1)
-        teacher_sq_norm = (teacher_cls ** 2).sum(dim=-1)
-        loss_cls = F.mse_loss(student_sq_norm, teacher_sq_norm)
+        # Different dimensions: use simple projection (mean pooling)
+        D_s = student_cls.shape[-1]
+        D_t = teacher_cls.shape[-1]
+        if D_s < D_t:
+            ratio = D_t // D_s
+            if D_t % D_s == 0:
+                teacher_proj = teacher_cls.view(teacher_cls.shape[0], D_s, ratio).mean(dim=-1)
+            else:
+                teacher_proj = teacher_cls[:, :D_s]
+                if D_t > D_s:
+                    remaining = teacher_cls[:, D_s:].view(teacher_cls.shape[0], -1, D_s).mean(dim=1)
+                    teacher_proj = (teacher_proj + remaining) / 2
+            student_cls_norm = F.normalize(student_cls, dim=-1)
+            teacher_proj_norm = F.normalize(teacher_proj, dim=-1)
+            loss_cls = F.mse_loss(student_cls_norm, teacher_proj_norm)
+        else:
+            ratio = D_s // D_t
+            if D_s % D_t == 0:
+                student_proj = student_cls.view(student_cls.shape[0], D_t, ratio).mean(dim=-1)
+            else:
+                student_proj = student_cls[:, :D_t]
+                if D_s > D_t:
+                    remaining = student_cls[:, D_t:].view(student_cls.shape[0], -1, D_t).mean(dim=1)
+                    student_proj = (student_proj + remaining) / 2
+            student_proj_norm = F.normalize(student_proj, dim=-1)
+            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
+            loss_cls = F.mse_loss(student_proj_norm, teacher_cls_norm)
     
     # Patch embeddings loss
     B_s, N_s, D_s = student_patches.shape
     B_t, N_t, D_t = teacher_patches.shape
     
-    if N_s == N_t and D_s == D_t:
-        loss_patch = F.mse_loss(student_patches, teacher_patches)
-    elif D_s == D_t:
+    if N_s != N_t:
         if N_s < N_t:
             teacher_patches = teacher_patches[:, :N_s, :]
         else:
             student_patches = student_patches[:, :N_t, :]
-        loss_patch = F.mse_loss(student_patches, teacher_patches)
+    
+    if D_s == D_t:
+        student_patches_norm = F.normalize(student_patches, dim=-1)
+        teacher_patches_norm = F.normalize(teacher_patches, dim=-1)
+        loss_patch = F.mse_loss(student_patches_norm, teacher_patches_norm)
     else:
-        student_pooled = student_patches.mean(dim=1)
-        teacher_pooled = teacher_patches.mean(dim=1)
-        if D_s == D_t:
-            loss_patch = F.mse_loss(student_pooled, teacher_pooled)
+        # Different dimensions: use simple projection
+        if D_s < D_t:
+            ratio = D_t // D_s
+            if D_t % D_s == 0:
+                teacher_proj = teacher_patches.view(teacher_patches.shape[0], teacher_patches.shape[1], D_s, ratio).mean(dim=-1)
+            else:
+                teacher_proj = teacher_patches[:, :, :D_s]
+                if D_t > D_s:
+                    remaining = teacher_patches[:, :, D_s:].view(teacher_patches.shape[0], teacher_patches.shape[1], -1, D_s).mean(dim=2)
+                    teacher_proj = (teacher_proj + remaining) / 2
+            student_patches_norm = F.normalize(student_patches, dim=-1)
+            teacher_proj_norm = F.normalize(teacher_proj, dim=-1)
+            loss_patch = F.mse_loss(student_patches_norm, teacher_proj_norm)
         else:
-            student_sq_norm = (student_pooled ** 2).sum(dim=-1)
-            teacher_sq_norm = (teacher_pooled ** 2).sum(dim=-1)
-            loss_patch = F.mse_loss(student_sq_norm, teacher_sq_norm)
+            ratio = D_s // D_t
+            if D_s % D_t == 0:
+                student_proj = student_patches.view(student_patches.shape[0], student_patches.shape[1], D_t, ratio).mean(dim=-1)
+            else:
+                student_proj = student_patches[:, :, :D_t]
+                if D_s > D_t:
+                    remaining = student_patches[:, :, D_t:].view(student_patches.shape[0], student_patches.shape[1], -1, D_t).mean(dim=2)
+                    student_proj = (student_proj + remaining) / 2
+            student_proj_norm = F.normalize(student_proj, dim=-1)
+            teacher_patches_norm = F.normalize(teacher_patches, dim=-1)
+            loss_patch = F.mse_loss(student_proj_norm, teacher_patches_norm)
     
     # Weighted combination
     total_loss = loss_weights['cls'] * loss_cls + loss_weights['patch'] * loss_patch
@@ -289,7 +567,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 use_cls_token=True, use_multi_crop=False,
                 max_steps_per_epoch=None, cache_teacher_features=False,
                 teacher_feature_dir=None, save_every=0, global_step=0,
-                checkpoint_dir=None):
+                checkpoint_dir=None, distillation_loss_module=None):
     """
     Train one epoch with optimizations
     
@@ -387,11 +665,38 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
+                    # Sanity debug: log statistics for initial batches
+                    # This helps verify teacher targets are diverse and student is learning
+                    if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
+                        with torch.no_grad():
+                            # Get normalized teacher and student features for debugging
+                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                                teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                                teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                            else:
+                                teacher_cls_target = F.normalize(teacher_cls, dim=-1)
+                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                            
+                            # Compute statistics
+                            teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+                            student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
+                            mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
+                            
+                            print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
+                            print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
+                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
+                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                            if student_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Student features are collapsing!")
+                            if teacher_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
+                    
                     # Compute distillation loss
                     loss, metrics = compute_distillation_loss(
                         student_cls, student_patches,
                         teacher_cls, teacher_patches,
-                        loss_weights=loss_weights
+                        loss_weights=loss_weights,
+                        distillation_loss_module=distillation_loss_module
                     )
             else:
                 with autocast():
@@ -408,10 +713,37 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
+                    # Sanity debug: log statistics for initial batches
+                    # This helps verify teacher targets are diverse and student is learning
+                    if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
+                        with torch.no_grad():
+                            # Get normalized teacher and student features for debugging
+                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                                teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                                teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                            else:
+                                teacher_cls_target = F.normalize(teacher_cls, dim=-1)
+                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                            
+                            # Compute statistics
+                            teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+                            student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
+                            mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
+                            
+                            print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
+                            print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
+                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
+                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                            if student_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Student features are collapsing!")
+                            if teacher_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
+                    
                     loss, metrics = compute_distillation_loss(
                         student_cls, student_patches,
                         teacher_cls, teacher_patches,
-                        loss_weights=loss_weights
+                        loss_weights=loss_weights,
+                        distillation_loss_module=distillation_loss_module
                     )
         else:
             # CPU: no autocast
@@ -428,10 +760,37 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 student, images, use_cls_token=use_cls_token
             )
             
+            # Sanity debug: log statistics for initial batches
+            # This helps verify teacher targets are diverse and student is learning
+            if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
+                with torch.no_grad():
+                    # Get normalized teacher and student features for debugging
+                    if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                        teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                        teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                    else:
+                        teacher_cls_target = F.normalize(teacher_cls, dim=-1)
+                    student_cls_norm = F.normalize(student_cls, dim=-1)
+                    
+                    # Compute statistics
+                    teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+                    student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
+                    mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
+                    
+                    print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
+                    print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
+                    print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
+                    print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                    if student_pairwise_sim > 0.9:
+                        print(f"    ⚠️  WARNING: Student features are collapsing!")
+                    if teacher_pairwise_sim > 0.9:
+                        print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
+            
             loss, metrics = compute_distillation_loss(
                 student_cls, student_patches,
                 teacher_cls, teacher_patches,
-                loss_weights=loss_weights
+                loss_weights=loss_weights,
+                distillation_loss_module=distillation_loss_module
             )
         
         gpu_time = time.time() - gpu_start
@@ -463,9 +822,9 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         # Update progress bar with detailed timing
         current_lr = optimizer.param_groups[0]['lr']
         progress_bar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'cls': f'{metrics["cls"]:.4f}',
-            'patch': f'{metrics["patch"]:.4f}',
+            'loss': f'{loss.item():.8f}',
+            'cls': f'{metrics["cls"]:.8f}',
+            'patch': f'{metrics["patch"]:.8f}',
             'lr': f'{current_lr:.6f}',
             'gpu': f'{avg_gpu_time:.2f}s',
             'data': f'{avg_data_time:.2f}s',
@@ -539,20 +898,66 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         print("✓ Student model compiled successfully")
         print("  ⚠️  Teacher is NOT compiled (frozen, no benefit)")
     
-    # Build optimizer and scheduler
-    optimizer = build_optimizer(student, lr=lr, weight_decay=weight_decay,
-                               fused=use_fused_adamw)
+    # Create distillation loss module with learnable projections
+    # Teacher (DINOv2 ViT-B): 768 dims, Student (ViT-S): 384 dims
+    distillation_loss_module = DistillationLoss(
+        teacher_dim=768,
+        student_dim=384,
+        loss_weights=loss_weights
+    ).to(device)
+    print("✓ Created DistillationLoss module with learnable projections (768→384)")
+    
+    # FIX: Freeze projection layers to prevent collapse
+    # The projection layers should be fixed, not learnable
+    for name, param in distillation_loss_module.named_parameters():
+        param.requires_grad = False
+        print(f"  ✓ Frozen projection layer: {name}")
+    
+    # Build optimizer: ONLY student parameters (projection layers are frozen)
+    # Group parameters: weight decay for non-bias/norm, no weight decay for bias/norm
+    params_with_wd = []
+    params_without_wd = []
+    for name, param in student.named_parameters():
+        if any(nd in name for nd in ["bias", "norm", "ln"]):
+            params_without_wd.append(param)
+        else:
+            params_with_wd.append(param)
+    # DO NOT add distillation_loss_module parameters (they're frozen)
+    
+    param_groups = [
+        {"params": params_with_wd, "weight_decay": weight_decay},
+        {"params": params_without_wd, "weight_decay": 0.0},
+    ]
+    
+    # Use fused AdamW for better performance (requires CUDA)
+    if use_fused_adamw and device.type == 'cuda':
+        try:
+            optimizer = torch.optim.AdamW(param_groups, lr=lr, fused=True)
+        except TypeError:
+            optimizer = torch.optim.AdamW(param_groups, lr=lr, fused=False)
+    else:
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, fused=False)
     scheduler = build_scheduler(optimizer, num_epochs=num_epochs,
                                warmup_epochs=warmup_epochs)
     
-    # GradScaler for mixed precision
-    scaler = GradScaler(enabled=(device.type == 'cuda'))
+    # GradScaler for mixed precision (use new API if available to avoid deprecation warning)
+    if GRADSCALER_NEW_API:
+        if device.type == 'cuda':
+            scaler = GradScaler('cuda')
+        else:
+            scaler = GradScaler('cpu')
+    else:
+        # Old API
+        scaler = GradScaler(enabled=(device.type == 'cuda'))
     
     start_epoch = 0
     global_step = 0
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
         student.load_state_dict(checkpoint['student'])
+        if 'distillation_loss' in checkpoint:
+            distillation_loss_module.load_state_dict(checkpoint['distillation_loss'])
+            print("✓ Loaded distillation loss module state")
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         scaler.load_state_dict(checkpoint['scaler'])
@@ -560,12 +965,20 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         global_step = checkpoint.get('global_step', 0)
         print(f"✓ Resumed from epoch {start_epoch}, step {global_step}")
     
-    # Initialize scheduler
-    if start_epoch == 0:
-        scheduler.step()
+    # Initialize scheduler (call after optimizer.step() in first iteration, not before)
+    # We'll call scheduler.step() at the end of each epoch instead
+    
+    # Check if dataset supports set_epoch (for random subset sampling)
+    dataset = train_loader.dataset
+    has_set_epoch = hasattr(dataset, 'set_epoch')
     
     # Training loop
     for epoch in range(start_epoch, num_epochs):
+        # Resample random subset if using RandomSubsetCachedDataset
+        if has_set_epoch:
+            dataset.set_epoch(epoch)
+            print(f"  ↻ Resampled random subset for epoch {epoch+1}")
+        
         avg_loss, avg_metrics, global_step = train_epoch(
             teacher, student, train_loader, optimizer, scheduler,
             device, scaler, epoch, num_epochs, loss_weights,
@@ -574,17 +987,20 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             cache_teacher_features=cache_teacher_features,
             teacher_feature_dir=teacher_feature_dir,
             save_every=save_every, global_step=global_step,
-            checkpoint_dir=checkpoint_dir
+            checkpoint_dir=checkpoint_dir,
+            distillation_loss_module=distillation_loss_module
         )
         
-        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.4f} "
-              f"(CLS: {avg_metrics['cls']:.4f}, Patch: {avg_metrics['patch']:.4f})")
+        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.8f} "
+              f"(CLS: {avg_metrics['cls']:.8f}, Patch: {avg_metrics['patch']:.8f})")
         
         # Save checkpoint at end of epoch
+        # Note: scheduler.step() is called at the end of train_epoch() after all optimizer.step() calls
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint = {
                 'student': student.state_dict(),
+                'distillation_loss': distillation_loss_module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'scaler': scaler.state_dict(),

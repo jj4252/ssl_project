@@ -1,16 +1,18 @@
 # Data loading configuration for CIFAR-10/100
+# Experiment: Train KD on CIFAR10, evaluate on CIFAR10 (same distribution)
 
 # Dataset configuration
 dataset_name: "cifar10"  # Options: "cifar10" or "cifar100"
 dataset_root: "./data"  # Root directory for CIFAR data (will download if not present)
-max_samples: 20000  # Limit to 20K images for quick testing
+max_samples: null  # null = use full dataset (50K training images for CIFAR10)
 
 # Image size
-image_size: 224  # Match student image size (CIFAR will be upscaled)
+# CIFAR10 images are 32x32, will be upscaled to image_size for student
+# Teacher will receive 224x224 (upscaled from student size)
+image_size: 96  # Match student model size (will be upscaled from 32x32)
 
-# DataLoader settings
-num_workers: 4
-persistent_workers: false
-prefetch_factor: 2
+# DataLoader settings (optimized for Slurm)
+num_workers: 2  # Reduced to prevent OOM
+persistent_workers: false  # Must be false
+prefetch_factor: 1  # Reduced to prevent OOM
 pin_memory: true
-
