@@ -19,6 +19,14 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sys
+from pathlib import Path
+
+# Add current directory to Python path for local imports
+current_dir = Path(__file__).parent.absolute()
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
+
 # Try to import new GradScaler API (PyTorch 2.0+), fall back to old API
 try:
     from torch.amp import GradScaler
@@ -37,7 +45,6 @@ except ImportError:
 from tqdm import tqdm
 import os
 import time
-from pathlib import Path
 import hashlib
 import itertools
 
@@ -1071,12 +1078,10 @@ def main():
         train_cfg['max_steps_per_epoch'] = args.max_steps_per_epoch
         print(f"✓ Overrode max_steps_per_epoch to {args.max_steps_per_epoch}")
     
-    # Handle precompute-only mode
+    # Handle precompute-only mode (not used for CIFAR10, but kept for compatibility)
     if args.precompute_cache_only:
-        print("Precompute cache mode: Running cache precomputation only...")
-        from precompute_cache import precompute_cache
-        precompute_cache(data_cfg, train_cfg, batch_size=256)
-        print("✓ Cache precomputation complete. Exiting.")
+        print("⚠️  Precompute cache mode not supported for CIFAR10 experiment")
+        print("   CIFAR10 uses direct dataset loading, not cached tensors")
         return
     
     # Device
