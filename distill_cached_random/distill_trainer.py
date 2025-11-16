@@ -380,11 +380,10 @@ class DistillationLoss(nn.Module):
             print(f"  ✓ Verified: Normalization uses dim=-1 (feature dim), NOT dim=0 (batch dim)")
             print(f"  ✓ Using cosine similarity loss (1 - cosine_sim) instead of MSE")
         
-        # Cosine similarity loss: compute per-sample cosine similarity, then average
-        # This ensures student must match each teacher target individually
-        # cosine_sim = (s · t) for normalized vectors, shape: [B]
-        cosine_sim_cls = (student_cls_norm * teacher_cls_target).sum(dim=-1)  # [B] per-sample cosine similarity
-        loss_cls = (1 - cosine_sim_cls).mean()  # Average over batch only
+        # CLS loss: per-sample cosine, then mean
+        # Use F.cosine_similarity for explicit per-sample computation
+        cosine_sim_cls = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1)  # [B]
+        loss_cls = (1.0 - cosine_sim_cls).mean()
         
         # Patch embeddings loss
         B_s, N_s, D_s = student_patches.shape
@@ -430,10 +429,15 @@ class DistillationLoss(nn.Module):
             print(f"  ✓ Using cosine similarity loss (1 - cosine_sim) instead of MSE")
             self._diagnostic_printed = True
         
-        # Cosine similarity loss for patches: compute per-sample, per-patch cosine similarity
-        # cosine_sim = (s · t) for normalized vectors, shape: [B, N]
-        cosine_sim_patch = (student_patches_norm * teacher_patches_target).sum(dim=-1)  # [B, N] per-sample, per-patch
-        loss_patch = (1 - cosine_sim_patch).mean()  # Average over batch and patches
+        # PATCHES loss: per-sample, per-patch cosine, then mean
+        # Flatten to [B*N, D] for per-patch cosine similarity
+        B, N, D = student_patches_norm.shape
+        cosine_sim_patch = F.cosine_similarity(
+            student_patches_norm.view(-1, D),
+            teacher_patches_target.view(-1, D),
+            dim=-1,
+        )  # [B*N]
+        loss_patch = (1.0 - cosine_sim_patch).mean()
         
         # Weighted combination
         total_loss = self.loss_weights['cls'] * loss_cls + self.loss_weights['patch'] * loss_patch
@@ -661,29 +665,31 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
-                    # Debug: Print feature statistics on first batch of first epoch
-                    if batch_idx == 0 and epoch == 0:
-                        print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
-                        print(f"  Teacher CLS: shape={teacher_cls.shape}, std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
-                        print(f"  Student CLS: shape={student_cls.shape}, std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
-                        # Compute cosine similarity (handle dimension mismatch by projecting teacher)
-                        if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
-                            teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
-                            teacher_cls_proj_norm = F.normalize(teacher_cls_proj, dim=-1)
+                    # Sanity debug: log statistics for initial batches
+                    # This helps verify teacher targets are diverse and student is learning
+                    if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
+                        with torch.no_grad():
+                            # Get normalized teacher and student features for debugging
+                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                                teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                                teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                            else:
+                                teacher_cls_target = F.normalize(teacher_cls, dim=-1)
                             student_cls_norm = F.normalize(student_cls, dim=-1)
-                            cosine_sim = (teacher_cls_proj_norm * student_cls_norm).sum(dim=-1).mean().item()
-                        elif teacher_cls.shape[-1] == student_cls.shape[-1]:
-                            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
-                            student_cls_norm = F.normalize(student_cls, dim=-1)
-                            cosine_sim = (teacher_cls_norm * student_cls_norm).sum(dim=-1).mean().item()
-                        else:
-                            cosine_sim = None
-                        if cosine_sim is not None:
-                            print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
-                        else:
-                            print(f"  CLS cosine similarity: N/A (dimension mismatch: {teacher_cls.shape[-1]} vs {student_cls.shape[-1]})")
-                        print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
-                        print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
+                            
+                            # Compute statistics
+                            teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+                            student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
+                            mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
+                            
+                            print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
+                            print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
+                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
+                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                            if student_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Student features are collapsing!")
+                            if teacher_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
                     
                     # Compute distillation loss
                     loss, metrics = compute_distillation_loss(
@@ -707,29 +713,31 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         student, images, use_cls_token=use_cls_token
                     )
                     
-                    # Debug: Print feature statistics on first batch of first epoch
-                    if batch_idx == 0 and epoch == 0:
-                        print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
-                        print(f"  Teacher CLS: shape={teacher_cls.shape}, std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
-                        print(f"  Student CLS: shape={student_cls.shape}, std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
-                        # Compute cosine similarity (handle dimension mismatch by projecting teacher)
-                        if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
-                            teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
-                            teacher_cls_proj_norm = F.normalize(teacher_cls_proj, dim=-1)
+                    # Sanity debug: log statistics for initial batches
+                    # This helps verify teacher targets are diverse and student is learning
+                    if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
+                        with torch.no_grad():
+                            # Get normalized teacher and student features for debugging
+                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                                teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                                teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                            else:
+                                teacher_cls_target = F.normalize(teacher_cls, dim=-1)
                             student_cls_norm = F.normalize(student_cls, dim=-1)
-                            cosine_sim = (teacher_cls_proj_norm * student_cls_norm).sum(dim=-1).mean().item()
-                        elif teacher_cls.shape[-1] == student_cls.shape[-1]:
-                            teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
-                            student_cls_norm = F.normalize(student_cls, dim=-1)
-                            cosine_sim = (teacher_cls_norm * student_cls_norm).sum(dim=-1).mean().item()
-                        else:
-                            cosine_sim = None
-                        if cosine_sim is not None:
-                            print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
-                        else:
-                            print(f"  CLS cosine similarity: N/A (dimension mismatch: {teacher_cls.shape[-1]} vs {student_cls.shape[-1]})")
-                        print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
-                        print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
+                            
+                            # Compute statistics
+                            teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+                            student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
+                            mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
+                            
+                            print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
+                            print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
+                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
+                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                            if student_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Student features are collapsing!")
+                            if teacher_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
                     
                     loss, metrics = compute_distillation_loss(
                         student_cls, student_patches,
@@ -752,29 +760,31 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 student, images, use_cls_token=use_cls_token
             )
             
-            # Debug: Print feature statistics on first batch of first epoch
-            if batch_idx == 0 and epoch == 0:
-                print(f"\n🔍 Debug: Feature statistics (first batch, epoch {epoch+1})")
-                print(f"  Teacher CLS: shape={teacher_cls.shape}, std={teacher_cls.std().item():.6f}, mean={teacher_cls.mean().item():.6f}, norm={teacher_cls.norm(dim=-1).mean().item():.6f}")
-                print(f"  Student CLS: shape={student_cls.shape}, std={student_cls.std().item():.6f}, mean={student_cls.mean().item():.6f}, norm={student_cls.norm(dim=-1).mean().item():.6f}")
-                # Compute cosine similarity (handle dimension mismatch by projecting teacher)
-                if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
-                    teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
-                    teacher_cls_proj_norm = F.normalize(teacher_cls_proj, dim=-1)
+            # Sanity debug: log statistics for initial batches
+            # This helps verify teacher targets are diverse and student is learning
+            if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
+                with torch.no_grad():
+                    # Get normalized teacher and student features for debugging
+                    if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
+                        teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
+                        teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                    else:
+                        teacher_cls_target = F.normalize(teacher_cls, dim=-1)
                     student_cls_norm = F.normalize(student_cls, dim=-1)
-                    cosine_sim = (teacher_cls_proj_norm * student_cls_norm).sum(dim=-1).mean().item()
-                elif teacher_cls.shape[-1] == student_cls.shape[-1]:
-                    teacher_cls_norm = F.normalize(teacher_cls, dim=-1)
-                    student_cls_norm = F.normalize(student_cls, dim=-1)
-                    cosine_sim = (teacher_cls_norm * student_cls_norm).sum(dim=-1).mean().item()
-                else:
-                    cosine_sim = None
-                if cosine_sim is not None:
-                    print(f"  CLS cosine similarity: {cosine_sim:.6f} (1.0 = identical, 0.0 = orthogonal)")
-                else:
-                    print(f"  CLS cosine similarity: N/A (dimension mismatch: {teacher_cls.shape[-1]} vs {student_cls.shape[-1]})")
-                print(f"  Teacher patches: shape={teacher_patches.shape}, std={teacher_patches.std().item():.6f}")
-                print(f"  Student patches: shape={student_patches.shape}, std={student_patches.std().item():.6f}")
+                    
+                    # Compute statistics
+                    teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
+                    student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
+                    mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
+                    
+                    print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
+                    print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
+                    print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
+                    print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                    if student_pairwise_sim > 0.9:
+                        print(f"    ⚠️  WARNING: Student features are collapsing!")
+                    if teacher_pairwise_sim > 0.9:
+                        print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
             
             loss, metrics = compute_distillation_loss(
                 student_cls, student_patches,
@@ -897,8 +907,13 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
     ).to(device)
     print("✓ Created DistillationLoss module with learnable projections (768→384)")
     
-    # Build optimizer: include both student and projection layers
-    # Combine student parameters and distillation loss projection parameters
+    # FIX: Freeze projection layers to prevent collapse
+    # The projection layers should be fixed, not learnable
+    for name, param in distillation_loss_module.named_parameters():
+        param.requires_grad = False
+        print(f"  ✓ Frozen projection layer: {name}")
+    
+    # Build optimizer: ONLY student parameters (projection layers are frozen)
     # Group parameters: weight decay for non-bias/norm, no weight decay for bias/norm
     params_with_wd = []
     params_without_wd = []
@@ -907,11 +922,7 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             params_without_wd.append(param)
         else:
             params_with_wd.append(param)
-    for name, param in distillation_loss_module.named_parameters():
-        if any(nd in name for nd in ["bias", "norm", "ln"]):
-            params_without_wd.append(param)
-        else:
-            params_with_wd.append(param)
+    # DO NOT add distillation_loss_module parameters (they're frozen)
     
     param_groups = [
         {"params": params_with_wd, "weight_decay": weight_decay},
