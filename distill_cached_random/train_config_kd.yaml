@@ -3,7 +3,7 @@
 
 # Training hyperparameters
 batch_size: 64
-num_epochs: 100
+num_epochs: 250
 learning_rate: 0.0005  # 5e-4
 weight_decay: 0.04
 warmup_epochs: 10
