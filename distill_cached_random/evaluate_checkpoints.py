@@ -461,6 +461,9 @@ def main():
     test_features, test_labels = extract_features(student, test_loader, device, use_cls_token=use_cls_token)
     print(f"  Test features shape: {test_features.shape}")
     
+    # Initialize results dictionary
+    results = {}
+    
     # Evaluate teacher model if requested
     if args.eval_teacher:
         print(f"\n{'='*60}")
@@ -574,9 +577,6 @@ def main():
         }
     
     # Evaluate each checkpoint
-    if not results:
-        results = {}
-    
     # Sort checkpoints: handle mixed int/str keys by converting to comparable format
     def sort_key(item):
         name, path = item
