@@ -319,10 +319,39 @@ def compute_distillation_loss(student_cls, student_patches,
     if student_cls.shape[-1] == teacher_cls.shape[-1]:
         loss_cls = F.mse_loss(student_cls, teacher_cls)
     else:
-        # Different dimensions: use squared norm loss
-        student_sq_norm = (student_cls ** 2).sum(dim=-1)
-        teacher_sq_norm = (teacher_cls ** 2).sum(dim=-1)
-        loss_cls = F.mse_loss(student_sq_norm, teacher_sq_norm)
+        # Different dimensions: project larger embedding to match smaller one
+        # Since both are L2-normalized, we project and then compute MSE
+        # This preserves semantic information better than squared norm loss
+        D_s = student_cls.shape[-1]
+        D_t = teacher_cls.shape[-1]
+        
+        if D_s < D_t:
+            # Student smaller (e.g., 384): project teacher (768) down to 384
+            # For 768 -> 384: reshape [B, 384, 2] and mean pool -> [B, 384]
+            ratio = D_t // D_s
+            if D_t % D_s == 0:
+                # Perfect division (e.g., 768/384 = 2)
+                teacher_proj = teacher_cls.view(teacher_cls.shape[0], D_s, ratio).mean(dim=-1)
+            else:
+                # Not perfect: use adaptive approach
+                # Take first D_s dimensions and average remaining
+                teacher_proj = teacher_cls[:, :D_s]  # Take first D_s dims
+                if D_t > D_s:
+                    # Average remaining dimensions and add
+                    remaining = teacher_cls[:, D_s:].view(teacher_cls.shape[0], -1, D_s).mean(dim=1)
+                    teacher_proj = (teacher_proj + remaining) / 2
+            loss_cls = F.mse_loss(student_cls, teacher_proj)
+        else:
+            # Teacher smaller: project student down to teacher dimension
+            ratio = D_s // D_t
+            if D_s % D_t == 0:
+                student_proj = student_cls.view(student_cls.shape[0], D_t, ratio).mean(dim=-1)
+            else:
+                student_proj = student_cls[:, :D_t]
+                if D_s > D_t:
+                    remaining = student_cls[:, D_t:].view(student_cls.shape[0], -1, D_t).mean(dim=1)
+                    student_proj = (student_proj + remaining) / 2
+            loss_cls = F.mse_loss(student_proj, teacher_cls)
     
     # Patch embeddings loss
     B_s, N_s, D_s = student_patches.shape
@@ -337,14 +366,35 @@ def compute_distillation_loss(student_cls, student_patches,
             student_patches = student_patches[:, :N_t, :]
         loss_patch = F.mse_loss(student_patches, teacher_patches)
     else:
-        student_pooled = student_patches.mean(dim=1)
-        teacher_pooled = teacher_patches.mean(dim=1)
+        # Different number of patches or different dimensions: pool first, then handle dim mismatch
+        student_pooled = student_patches.mean(dim=1)  # [B, D_s]
+        teacher_pooled = teacher_patches.mean(dim=1)  # [B, D_t]
         if D_s == D_t:
             loss_patch = F.mse_loss(student_pooled, teacher_pooled)
         else:
-            student_sq_norm = (student_pooled ** 2).sum(dim=-1)
-            teacher_sq_norm = (teacher_pooled ** 2).sum(dim=-1)
-            loss_patch = F.mse_loss(student_sq_norm, teacher_sq_norm)
+            # Different dimensions: project larger to match smaller (same as CLS loss)
+            if D_s < D_t:
+                # Student smaller: project teacher down
+                ratio = D_t // D_s
+                if D_t % D_s == 0:
+                    teacher_proj = teacher_pooled.view(teacher_pooled.shape[0], D_s, ratio).mean(dim=-1)
+                else:
+                    teacher_proj = teacher_pooled[:, :D_s]
+                    if D_t > D_s:
+                        remaining = teacher_pooled[:, D_s:].view(teacher_pooled.shape[0], -1, D_s).mean(dim=1)
+                        teacher_proj = (teacher_proj + remaining) / 2
+                loss_patch = F.mse_loss(student_pooled, teacher_proj)
+            else:
+                # Teacher smaller: project student down
+                ratio = D_s // D_t
+                if D_s % D_t == 0:
+                    student_proj = student_pooled.view(student_pooled.shape[0], D_t, ratio).mean(dim=-1)
+                else:
+                    student_proj = student_pooled[:, :D_t]
+                    if D_s > D_t:
+                        remaining = student_pooled[:, D_t:].view(student_pooled.shape[0], -1, D_t).mean(dim=1)
+                        student_proj = (student_proj + remaining) / 2
+                loss_patch = F.mse_loss(student_proj, teacher_pooled)
     
     # Weighted combination
     total_loss = loss_weights['cls'] * loss_cls + loss_weights['patch'] * loss_patch
