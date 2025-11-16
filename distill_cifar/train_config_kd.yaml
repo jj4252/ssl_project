@@ -53,7 +53,7 @@ save_every: 100  # Save checkpoint every N steps (0 = only at end of epoch)
 # SSL (Self-Supervised Learning) configuration
 # Adds Barlow Twins loss on top of KD to improve feature discriminativeness
 ssl:
-  enabled: false  # Set to true to enable SSL (Barlow Twins)
+  enabled: true  # Set to true to enable SSL (Barlow Twins)
   type: "barlow"  # SSL loss type (currently only "barlow" supported)
   weight: 0.5     # Weight for SSL loss: L_total = L_kd + weight * L_ssl
   barlow_lambd: 0.005  # Lambda for Barlow Twins off-diagonal term (default: 5e-3)
