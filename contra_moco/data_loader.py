@@ -1,110 +1,81 @@
 """
-Data loading module for DINO training with optional cached tensor support.
-Modified for random subset sampling per epoch.
-
-IMPORTANT: If you have a file named 'datasets.py' in your project directory,
-it will conflict with the HuggingFace 'datasets' package. 
-Please rename or delete any local 'datasets.py' file.
+Data loading module for MoCo-v3 training.
+Supports both CIFAR-10/100 and HuggingFace dataset with cached tensors.
 """
 
-import sys
-import json
 import os
+import json
 import random
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
-# Check if there's a conflicting local datasets.py file
-current_dir = Path(__file__).parent.absolute()
-local_datasets_file = current_dir / 'datasets.py'
-
-if local_datasets_file.exists():
-    raise ImportError(
-        f"ERROR: Found a local file 'datasets.py' at {local_datasets_file}\n"
-        f"This conflicts with the HuggingFace 'datasets' package.\n"
-        f"Please rename or delete this file. Suggested name: 'datasets_old.py' or 'datasets_backup.py'"
-    )
-
-# Import HuggingFace datasets package
-try:
-    from datasets import load_dataset
-except ImportError as e:
-    raise ImportError(
-        f"Failed to import 'load_dataset' from HuggingFace datasets package.\n"
-        f"Make sure you have installed it: pip install datasets\n"
-        f"Original error: {e}"
-    )
-
 from torch.utils.data import Dataset, Subset
 import torch
 from torchvision import transforms
+from torchvision.datasets import CIFAR10, CIFAR100
 from torchvision.transforms import InterpolationMode
 
 
-def _inspect_dataset_splits(dataset_name):
-    """Helper function to inspect available splits in a dataset"""
-    try:
-        dataset_dict = load_dataset(dataset_name, split=None)
-        if isinstance(dataset_dict, dict):
-            return list(dataset_dict.keys())
-        else:
-            # If it's a DatasetDict, get the keys
-            return list(dataset_dict.keys()) if hasattr(dataset_dict, 'keys') else ["train"]
-    except:
-        return ["train"]  # Default fallback
-
-
-class PretrainDataset(Dataset):
-    """Unlabeled pretraining dataset (~500k images)"""
-    def __init__(self, transform=None):
-        print("Loading pretraining dataset...")
-        # Try different possible split names
-        try:
-            # First try eval_public/train
-            self.dataset = load_dataset("tsbpp/fall2025_deeplearning",
-                                       split="eval_public/train")
-        except ValueError:
-            try:
-                # Try train split
-                self.dataset = load_dataset("tsbpp/fall2025_deeplearning",
-                                           split="train")
-            except ValueError:
-                # Try to inspect available splits
-                splits = _inspect_dataset_splits("tsbpp/fall2025_deeplearning")
-                if splits:
-                    self.dataset = load_dataset("tsbpp/fall2025_deeplearning",
-                                               split=splits[0])
-                else:
-                    raise ValueError("Could not find a valid split for the dataset")
+class CIFARDataset(Dataset):
+    """CIFAR dataset for pretraining (unlabeled, using only images)"""
+    def __init__(self, dataset_name="cifar10", root="./data", train=True, transform=None, max_samples=None, return_two_views=False):
+        """
+        Args:
+            dataset_name: "cifar10" or "cifar100"
+            root: Root directory for CIFAR data
+            train: Use training split (True) or test split (False)
+            transform: Transform to apply to images
+            max_samples: Maximum number of samples to use (None = use all)
+            return_two_views: If True, return two augmented views for SSL (Barlow Twins)
+        """
+        print(f"Loading {dataset_name.upper()} dataset...")
         
-        # Try to enable streaming if available
-        try:
-            if hasattr(self.dataset, 'set_format'):
-                self.dataset.set_format('pil')
-        except:
-            pass  # If not supported, continue without
+        # Load CIFAR dataset
+        if dataset_name.lower() == "cifar10":
+            self.dataset = CIFAR10(root=root, train=train, download=True, transform=None)
+        elif dataset_name.lower() == "cifar100":
+            self.dataset = CIFAR100(root=root, train=train, download=True, transform=None)
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}. Use 'cifar10' or 'cifar100'")
+        
+        # Limit to max_samples if specified
+        if max_samples is not None and len(self.dataset) > max_samples:
+            print(f"  Limiting dataset to {max_samples:,} samples (from {len(self.dataset):,})")
+            indices = list(range(max_samples))
+            self.dataset = Subset(self.dataset, indices)
         
         self.transform = transform
-        print(f"Loaded {len(self.dataset)} pretraining images")
+        self.return_two_views = return_two_views
+        print(f"  Loaded {len(self.dataset):,} images")
+        if return_two_views:
+            print(f"  ✓ Returning two views per image for SSL (Barlow Twins)")
     
     def __getitem__(self, idx):
-        # Optimized access - try direct indexing first
-        try:
-            item = self.dataset[idx]
-            # Handle both dict and direct image access
-            if isinstance(item, dict):
-                image = item["image"]
-            else:
-                image = item
-        except:
-            # Fallback to slower method if needed
-            image = self.dataset[idx]["image"]
+        # Get image (ignore label for pretraining)
+        if isinstance(self.dataset, Subset):
+            image, _ = self.dataset.dataset[self.dataset.indices[idx]]
+        else:
+            image, _ = self.dataset[idx]
         
         if self.transform:
-            views = self.transform(image)  # Multi-crop returns list
+            if self.return_two_views:
+                # Check if transform already returns two views (e.g., MoCoTransform)
+                result = self.transform(image)
+                if isinstance(result, tuple) and len(result) == 2:
+                    # Transform already returns (view1, view2)
+                    return result
+                else:
+                    # Transform returns single view, apply twice for two views
+                    view1 = self.transform(image)
+                    view2 = self.transform(image)  # Apply transform again (stochastic)
+                    return view1, view2
+            else:
+                views = self.transform(image)  # Multi-crop returns list
+                return views
         else:
-            views = image
-        return views
+            if self.return_two_views:
+                return image, image  # Return same image twice if no transform
+            return image
     
     def __len__(self):
         return len(self.dataset)
@@ -169,31 +140,24 @@ class CachedTensorDataset(Dataset):
                 print(f"  ⚠️  Limited to first {max_shards} shard files (for testing)")
             
             # Build mapping from dataset index to global_start for partial cache support
-            # When only a subset of shards exists, we need to map dataset indices (0-N) 
-            # to the actual global_start values in cache files
             self._index_to_global = []
             for shard_entry in all_shards:
                 global_start = shard_entry["global_start"]
                 num_samples = shard_entry["num_samples"]
-                # Add all indices covered by this cache file
                 for i in range(num_samples):
                     self._index_to_global.append(global_start + i)
-                    # Apply max_samples limit if specified
                     if max_samples is not None and len(self._index_to_global) >= max_samples:
                         break
                 if max_samples is not None and len(self._index_to_global) >= max_samples:
                     break
             
-            # Apply max_samples limit if specified
             if max_samples is not None and max_samples > 0:
                 self._index_to_global = self._index_to_global[:max_samples]
-                # Also limit shards to only those that are actually used
                 used_global_indices = set(self._index_to_global)
                 all_shards = [s for s in all_shards 
                              if any(used_global_indices & set(range(s["global_start"], s["global_start"] + s["num_samples"])))]
                 print(f"  ⚠️  Limited to first {max_samples:,} samples (for testing)")
             
-            # Set num_samples to actual available samples (may be less than sum if gaps exist)
             self.num_samples = len(self._index_to_global)
             self.shards = all_shards
             self.cache_image_size = cache_image_size
@@ -212,19 +176,15 @@ class CachedTensorDataset(Dataset):
             self.cache_image_size = index.get("cache_image_size", 256)
             self.cache_dtype = index.get("cache_dtype", "float32")
             
-            # Apply subset limits if specified (for testing)
             if max_shards is not None and max_shards > 0:
                 self.shards = self.shards[:max_shards]
                 print(f"  ⚠️  Limited to first {max_shards} shard files (for testing)")
             
-            # Build index mapping for legacy format (sequential, no global_start)
-            # Legacy format assumes sequential shards starting from 0
             total_samples_available = sum(s["num_samples"] for s in self.shards)
             self._index_to_global = list(range(total_samples_available))
             
             if max_samples is not None and max_samples > 0:
                 self._index_to_global = self._index_to_global[:max_samples]
-                # Limit shards to only those needed
                 samples_per_shard = self.shards[0]["num_samples"] if self.shards else 0
                 if samples_per_shard > 0:
                     num_shards_needed = (max_samples + samples_per_shard - 1) // samples_per_shard
@@ -241,21 +201,15 @@ class CachedTensorDataset(Dataset):
                 f"Please run precompute_cache.py first to create the cache."
             )
         
-        # Build mapping for efficient idx -> shard lookup
-        # For parallel sharded format, we need to map global dataset indices to cache files
-        # Each cache file has a global_start that indicates its position in the original dataset
-        # We'll use binary search on global_start values to find the right cache file
-        
         # Sort shards by global_start for binary search
-        self.shards.sort(key=lambda x: x["global_start"])
+        self.shards.sort(key=lambda x: x.get("global_start", 0))
         
         # Build prefix sum for sequential access (for legacy format compatibility)
-        # But for sharded format, we'll use global_start-based lookup
         self.shard_prefix_sum = [0]
         for shard in self.shards:
             self.shard_prefix_sum.append(self.shard_prefix_sum[-1] + shard["num_samples"])
         
-        # In-memory cache for loaded shards (per-epoch caching)
+        # In-memory cache for loaded shards
         self._shard_cache: Dict[str, torch.Tensor] = {}
         
         print(f"✓ Loaded cached dataset: {self.num_samples:,} samples in {len(self.shards)} cache files")
@@ -263,40 +217,19 @@ class CachedTensorDataset(Dataset):
         print(f"  Cache dtype: {self.cache_dtype}")
     
     def _load_shard(self, shard_path: str) -> torch.Tensor:
-        """
-        Load a shard file into memory (with caching).
-        
-        Args:
-            shard_path: Relative path to shard file (e.g., "images_shard_00000.pt")
-        
-        Returns:
-            Tensor of shape [N, 3, H, W]
-        """
+        """Load a shard file into memory (with caching)."""
         if shard_path not in self._shard_cache:
             full_path = self.cache_dir / shard_path
             if not full_path.exists():
                 raise FileNotFoundError(f"Shard file not found: {full_path}")
-            
             shard_data = torch.load(full_path, map_location='cpu')
             self._shard_cache[shard_path] = shard_data["images"]
-        
         return self._shard_cache[shard_path]
     
     def _find_shard(self, idx: int) -> Tuple[int, int]:
-        """
-        Find which shard contains the given global index.
-        
-        Args:
-            idx: Global sample index (0-based, corresponds to original dataset position)
-        
-        Returns:
-            Tuple of (shard_index, local_index_within_shard)
-        """
-        # Check if shards have global_start (parallel sharded format)
-        # If they do, use global_start-based lookup
+        """Find which shard contains the given global index."""
         if self.shards and "global_start" in self.shards[0]:
-            # Binary search based on global_start to find the cache file containing this index
-            # Cache files are sorted by global_start, and each covers [global_start, global_start + num_samples)
+            # Binary search based on global_start
             left, right = 0, len(self.shards) - 1
             best_shard_idx = -1
             
@@ -308,39 +241,24 @@ class CachedTensorDataset(Dataset):
                 shard_global_end = shard_global_start + shard_num_samples
                 
                 if shard_global_start <= idx < shard_global_end:
-                    # Found the shard containing this index
                     best_shard_idx = mid
                     break
                 elif idx < shard_global_start:
-                    # Index is before this shard, search left
                     right = mid - 1
                 else:
-                    # Index is after this shard, search right
                     left = mid + 1
             
             if best_shard_idx == -1:
-                # Fallback: use the last shard if index is at the boundary
                 if idx >= self.shards[-1]["global_start"]:
                     best_shard_idx = len(self.shards) - 1
                 else:
-                    raise IndexError(
-                        f"Index {idx} not found in any cache file. "
-                        f"Valid range: [0, {self.shards[-1]['global_start'] + self.shards[-1]['num_samples']})"
-                    )
+                    raise IndexError(f"Index {idx} not found in any cache file.")
             
             shard_info = self.shards[best_shard_idx]
             local_idx = idx - shard_info["global_start"]
-            
-            # Safety check
-            if local_idx < 0 or local_idx >= shard_info["num_samples"]:
-                raise IndexError(
-                    f"Local index {local_idx} out of range for shard {best_shard_idx} "
-                    f"(global_start={shard_info['global_start']}, num_samples={shard_info['num_samples']})"
-                )
-            
             return best_shard_idx, local_idx
         else:
-            # Legacy format: use prefix sum (sequential)
+            # Legacy format: use prefix sum
             left, right = 0, len(self.shard_prefix_sum) - 1
             while left < right:
                 mid = (left + right + 1) // 2
@@ -353,25 +271,15 @@ class CachedTensorDataset(Dataset):
             local_idx = idx - self.shard_prefix_sum[shard_idx]
             return shard_idx, local_idx
     
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        """
-        Get a single image tensor with augmentations applied.
-        
-        Args:
-            idx: Dataset sample index (0-based, relative to available cache)
-        
-        Returns:
-            Tensor of shape [3, H, W] (normalized and augmented)
-        """
+    def __getitem__(self, idx: int):
+        """Get a single image tensor with augmentations applied."""
         if idx < 0 or idx >= self.num_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.num_samples})")
         
         # Map dataset index to global_start if using partial cache
         if hasattr(self, '_index_to_global') and self._index_to_global:
-            # Map dataset index to actual global index in cache files
             global_idx = self._index_to_global[idx]
         else:
-            # Legacy format or full cache: use index directly
             global_idx = idx
         
         # Find which shard contains this global index
@@ -394,7 +302,6 @@ class CachedTensorDataset(Dataset):
                 # Check if transform already returns two views (e.g., MoCoTransform)
                 result = self.transform(img)
                 if isinstance(result, tuple) and len(result) == 2:
-                    # Transform already returns (view1, view2)
                     return result
                 else:
                     # Transform returns single view, apply twice for two views
@@ -403,12 +310,13 @@ class CachedTensorDataset(Dataset):
                     return view1, view2
             else:
                 img = self.transform(img)
-        
-        return img
-    
-    def clear_shard_cache(self):
-        """Clear shard cache (useful for memory management)"""
-        self._shard_cache.clear()
+                return img
+        else:
+            # No transform: return two views if requested, otherwise single view
+            if self.return_two_views:
+                return img, img
+            else:
+                return img
     
     def __len__(self) -> int:
         return self.num_samples
@@ -421,12 +329,6 @@ class RandomShardSubsetCachedDataset(Dataset):
     Instead of randomly sampling individual indices, this samples entire shard files.
     For each epoch, it randomly picks N shards and uses all images from those shards
     sequentially. This provides much better cache locality and I/O performance.
-    
-    Key features:
-    - Samples random shard files (not individual indices)
-    - Uses all images from selected shards sequentially
-    - Better cache locality and I/O patterns
-    - Resamples shards at the start of each epoch (via set_epoch)
     """
     def __init__(self, base_dataset: CachedTensorDataset, shards_per_epoch: int, seed: int = None):
         """
@@ -451,20 +353,16 @@ class RandomShardSubsetCachedDataset(Dataset):
         
         # Generate initial random shard selection
         self._resample_shards()
-        
-        # Build index mapping for current shard selection
         self._build_index_mapping()
         
         print(f"✓ RandomShardSubsetCachedDataset initialized:")
         print(f"  Total shards available: {self.total_shards}")
         print(f"  Shards per epoch: {self.shards_per_epoch}")
         print(f"  Samples per epoch: {self.num_samples:,}")
-        print(f"  Coverage: {100 * self.shards_per_epoch / self.total_shards:.1f}% of shards per epoch")
     
     def _resample_shards(self):
         """Resample random shards for the current epoch"""
         if self.seed is not None:
-            # Use epoch-specific seed for reproducibility
             random.seed(self.seed + self.current_epoch)
             torch.manual_seed(self.seed + self.current_epoch)
         
@@ -476,46 +374,30 @@ class RandomShardSubsetCachedDataset(Dataset):
         self.current_shards = [self.all_shards[i] for i in shard_indices]
     
     def _build_index_mapping(self):
-        """
-        Build mapping from dataset index to (shard_idx, local_idx) within selected shards.
-        This allows sequential access to images within the selected shards.
-        """
+        """Build mapping from dataset index to (shard_idx, local_idx) within selected shards."""
         self.index_to_shard_local = []
-        self.shard_start_indices = [0]  # Prefix sum for shard boundaries
+        self.shard_start_indices = [0]
         
         for shard in self.current_shards:
             num_samples = shard["num_samples"]
             global_start = shard["global_start"]
             
-            # Add all indices from this shard
             for local_idx in range(num_samples):
                 self.index_to_shard_local.append((len(self.shard_start_indices) - 1, local_idx, global_start + local_idx))
             
-            # Update prefix sum
             self.shard_start_indices.append(self.shard_start_indices[-1] + num_samples)
         
         self.num_samples = len(self.index_to_shard_local)
     
     def set_epoch(self, epoch: int):
-        """
-        Set the current epoch and resample shards.
-        Call this at the start of each training epoch.
-        """
+        """Set the current epoch and resample shards."""
         if epoch != self.current_epoch:
             self.current_epoch = epoch
             self._resample_shards()
             self._build_index_mapping()
     
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        """
-        Get item from the current epoch's selected shards.
-        
-        Args:
-            idx: Index in the current epoch's subset (0 to num_samples-1)
-        
-        Returns:
-            Tensor from base_dataset at the appropriate shard and local index
-        """
+    def __getitem__(self, idx: int):
+        """Get item from the current epoch's selected shards."""
         if idx < 0 or idx >= self.num_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.num_samples})")
         
@@ -541,7 +423,6 @@ class RandomShardSubsetCachedDataset(Dataset):
                 # Check if transform already returns two views (e.g., MoCoTransform)
                 result = self.base_dataset.transform(img)
                 if isinstance(result, tuple) and len(result) == 2:
-                    # Transform already returns (view1, view2)
                     return result
                 else:
                     # Transform returns single view, apply twice for two views
@@ -550,44 +431,23 @@ class RandomShardSubsetCachedDataset(Dataset):
                     return view1, view2
             else:
                 img = self.base_dataset.transform(img)
-        
-        return img
+                return img
+        else:
+            # No transform: return two views if requested, otherwise single view
+            if self.base_dataset.return_two_views:
+                return img, img
+            else:
+                return img
     
     def __len__(self) -> int:
         return self.num_samples
 
 
-def build_precompute_dataset(data_config: dict) -> Dataset:
-    """
-    Build a dataset for precomputing cache (deterministic preprocessing).
-    
-    This returns a dataset that applies deterministic preprocessing to images
-    for caching purposes. It does not include stochastic augmentations.
-    
-    Stage 1: Decode + resize only (no normalization, no augmentations)
-    Normalization will be applied during Stage 2 (training) along with augmentations.
-    """
-    from transforms import SimpleTransform
-    
-    image_size = data_config.get('image_size', 224)
-    
-    # For precomputation, use deterministic transform (no augmentations)
-    transform = SimpleTransform(
-        image_size=image_size,
-        scale=(1.0, 1.0)  # No random scaling, just resize
-    )
-    
-    dataset = PretrainDataset(transform=transform)
-    return dataset
-
-
 def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch.utils.data.DataLoader:
     """
-    Build DataLoader for pretraining.
+    Build pretraining DataLoader.
     
-    Supports two modes:
-    1. Cached tensor mode: Load from preprocessed tensor shards (fast)
-    2. Original mode: Load from HuggingFace/raw images (slower)
+    Supports both CIFAR-10/100 and HuggingFace dataset with cached tensors.
     
     Args:
         data_config: Data configuration dictionary
@@ -596,8 +456,22 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     Returns:
         DataLoader for pretraining
     """
-    from transforms import SimpleTransform, FastMultiCropTransform
+    from transforms import SimpleTransform, FastMultiCropTransform, MoCoTransform
     from tensor_augmentations import TensorSimpleTransform, TensorMultiCropTransform
+    
+    # Check training mode and determine if we need two views
+    training_mode = train_config.get('training_mode', 'kd')
+    use_moco_aug = train_config.get('use_moco_aug', False)
+    
+    # For MoCo-v3, always use MoCo transform (returns two views)
+    if training_mode == "moco_v3" or use_moco_aug:
+        return_two_views = True
+        print("✓ MoCo-v3 mode: will return two views per image")
+    else:
+        # Check if SSL is enabled (for Barlow Twins, need two views)
+        ssl_config = train_config.get('ssl', {})
+        use_ssl = ssl_config.get('enabled', False)
+        return_two_views = use_ssl
     
     # Check for cached mode (new setting takes precedence)
     use_cached_tensors = data_config.get('use_cached_tensors', data_config.get('use_cached', None))
@@ -621,10 +495,8 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         else:
             use_cached_tensors = False
     elif use_cached_tensors is False:
-        # Explicitly disabled
         use_cached_tensors = False
     else:
-        # Explicitly enabled
         use_cached_tensors = True
     
     if use_cached_tensors:
@@ -633,18 +505,24 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         cache_root = os.path.expandvars(cache_root)
         
         # Get training image size
-        image_size = data_config.get('image_size', 224)
+        image_size = data_config.get('image_size', 96)
         use_multi_crop = train_config.get('use_multi_crop', False)
-        use_local_crops = train_config.get('use_local_crops', False)
         
-        # Create tensor-based augmentations (work on unnormalized tensors [0, 1])
-        if use_multi_crop:
+        # For MoCo-v3, always use MoCo transform (works on tensors too)
+        if training_mode == "moco_v3" or use_moco_aug:
+            # MoCoTransform works on PIL images, but we have tensors
+            # We'll use TensorSimpleTransform and apply it twice for two views
+            transform = TensorSimpleTransform(
+                image_size=image_size,
+                scale=(0.2, 1.0)
+            )
+        elif use_multi_crop:
             transform = TensorMultiCropTransform(
                 global_crops_scale=tuple(data_config.get('global_crops_scale', [0.4, 1.0])),
                 local_crops_scale=tuple(data_config.get('local_crops_scale', [0.05, 0.4])),
                 local_crops_number=data_config.get('local_crops_number', 0),
                 image_size=image_size,
-                use_local_crops=use_local_crops
+                use_local_crops=train_config.get('use_local_crops', False)
             )
         else:
             transform = TensorSimpleTransform(
@@ -656,12 +534,8 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         max_shards = data_config.get('max_shards', None)
         max_samples = data_config.get('max_samples', None)
         
-        # Check if SSL is enabled (for Barlow Twins, need two views)
-        ssl_config = train_config.get('ssl', {})
-        use_ssl = ssl_config.get('enabled', False)
-        return_two_views = use_ssl  # Return two views if SSL is enabled
-        
         # Build base cached dataset (full dataset)
+        print(f"  Creating CachedTensorDataset with return_two_views={return_two_views}")
         base_dataset = CachedTensorDataset(
             cache_dir=cache_root, 
             transform=transform,
@@ -669,18 +543,10 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
             max_samples=max_samples,
             return_two_views=return_two_views
         )
+        print(f"  ✓ CachedTensorDataset created, return_two_views={base_dataset.return_two_views}")
         
         # Check if random shard sampling is enabled (preferred for performance)
         shards_per_epoch = data_config.get('shards_per_epoch', None)
-        # Fallback to old samples_per_epoch for backward compatibility
-        if shards_per_epoch is None:
-            samples_per_epoch = data_config.get('samples_per_epoch', None)
-            if samples_per_epoch is not None:
-                # Estimate shards needed (approximate)
-                cache_shard_size = data_config.get('cache_shard_size', 2048)
-                shards_per_epoch = max(1, (samples_per_epoch + cache_shard_size - 1) // cache_shard_size)
-                print(f"⚠️  Note: samples_per_epoch is deprecated, using shards_per_epoch={shards_per_epoch} (estimated)")
-        
         random_seed = data_config.get('random_subset_seed', None)
         
         if shards_per_epoch is not None and shards_per_epoch > 0:
@@ -697,14 +563,21 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
             dataset = base_dataset
             print(f"✓ Using full cached dataset from: {cache_root}")
         
-        print(f"  Applying full DINO-style augmentations on cached tensors")
+        print(f"  Applying augmentations on cached tensors")
     else:
-        # Original mode: load from HuggingFace/raw images
+        # Original mode: load from CIFAR or HuggingFace/raw images
+        dataset_name = data_config.get('dataset_name', 'cifar10')
+        dataset_root = data_config.get('dataset_root', './data')
+        max_samples = data_config.get('max_samples', None)
+        image_size = data_config.get('image_size', 96)
         use_multi_crop = train_config.get('use_multi_crop', False)
         use_local_crops = train_config.get('use_local_crops', False)
-        image_size = data_config.get('image_size', 224)
         
-        if use_multi_crop:
+        # For MoCo-v3, always use MoCo transform (returns two views)
+        if training_mode == "moco_v3" or use_moco_aug:
+            transform = MoCoTransform(image_size=image_size)
+            print("✓ Using MoCo-v3 style augmentations (two views per image)")
+        elif use_multi_crop:
             transform = FastMultiCropTransform(
                 global_crops_scale=tuple(data_config.get('global_crops_scale', [0.4, 1.0])),
                 local_crops_scale=tuple(data_config.get('local_crops_scale', [0.05, 0.4])),
@@ -718,8 +591,24 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
                 scale=(0.2, 1.0)
             )
         
-        dataset = PretrainDataset(transform=transform)
-        print(f"✓ Using original dataset (HuggingFace)")
+        # Check if dataset_name is CIFAR or HuggingFace
+        if dataset_name.lower() in ['cifar10', 'cifar100']:
+            # Create CIFAR dataset
+            dataset = CIFARDataset(
+                dataset_name=dataset_name,
+                root=dataset_root,
+                train=True,
+                transform=transform,
+                max_samples=max_samples,
+                return_two_views=return_two_views
+            )
+            print(f"✓ Using {dataset_name.upper()} dataset: {len(dataset):,} images")
+        else:
+            # HuggingFace dataset (not cached)
+            raise NotImplementedError(
+                f"HuggingFace dataset '{dataset_name}' requires cached tensors. "
+                f"Please run precompute_cache.py first or set use_cached_tensors=false to use CIFAR."
+            )
     
     # Build DataLoader
     num_workers = train_config.get('num_workers', data_config.get('num_workers', 4))
@@ -727,10 +616,49 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     prefetch_factor = train_config.get('prefetch_factor', data_config.get('prefetch_factor', 2)) if num_workers > 0 else None
     pin_memory = train_config.get('pin_memory', data_config.get('pin_memory', True))
     
+    # For MoCo-v3, drop_last=True is important for queue management
+    drop_last = (training_mode == "moco_v3" or use_moco_aug)
+    
     # Determine if we should shuffle
     # If using RandomShardSubsetCachedDataset, we already randomize shards per epoch,
     # so we can disable shuffle for better sequential access within shards
     should_shuffle = not isinstance(dataset, RandomShardSubsetCachedDataset)
+    
+    # Custom collate function for two-view batches
+    def collate_two_views(batch):
+        """Collate function for batches that return (view1, view2) tuples"""
+        if len(batch) == 0:
+            return batch
+        
+        # Check if first item is a tuple of two views
+        first_item = batch[0]
+        if isinstance(first_item, tuple) and len(first_item) == 2:
+            # Batch is list of (view1, view2) tuples
+            # Collate into (batch_view1, batch_view2) tuple of tensors
+            view1_list = [item[0] for item in batch]
+            view2_list = [item[1] for item in batch]
+            view1_batch = torch.stack(view1_list)
+            view2_batch = torch.stack(view2_list)
+            return (view1_batch, view2_batch)
+        elif isinstance(first_item, torch.Tensor):
+            # Single tensor - this shouldn't happen if return_two_views=True
+            # But handle it gracefully by duplicating
+            print(f"⚠️ Warning: collate_two_views received single tensor instead of tuple. "
+                  f"First item type: {type(first_item)}, shape: {first_item.shape if hasattr(first_item, 'shape') else 'N/A'}")
+            # Fallback: treat as single view and duplicate
+            batch_tensor = torch.stack(batch)
+            return (batch_tensor, batch_tensor)
+        else:
+            # Fallback to default collate
+            print(f"⚠️ Warning: collate_two_views received unexpected type: {type(first_item)}")
+            return torch.utils.data.default_collate(batch)
+    
+    # Use custom collate for MoCo-v3 (two views) or when return_two_views is True
+    collate_fn = collate_two_views if return_two_views else None
+    if return_two_views:
+        print(f"  ✓ Using custom collate function for two-view batches")
+    else:
+        print(f"  Using default collate function (return_two_views=False)")
     
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -738,44 +666,39 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         shuffle=should_shuffle,  # Disable shuffle for shard-level sampling (better cache locality)
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor
+        prefetch_factor=prefetch_factor,
+        collate_fn=collate_fn
     )
     
     return loader
 
 
-class EvalDataset(Dataset):
-    """Labeled evaluation dataset"""
-    def __init__(self, split="train", transform=None):
-        print(f"Loading evaluation dataset ({split})...")
-        # Try different possible split names
-        try:
-            # First try eval_public/{split}
-            self.dataset = load_dataset("tsbpp/fall2025_deeplearning",
-                                       split=f"eval_public/{split}")
-        except ValueError:
-            try:
-                # Try {split} directly
-                self.dataset = load_dataset("tsbpp/fall2025_deeplearning",
-                                           split=split)
-            except ValueError:
-                # Try to inspect available splits
-                splits = _inspect_dataset_splits("tsbpp/fall2025_deeplearning")
-                if splits:
-                    self.dataset = load_dataset("tsbpp/fall2025_deeplearning",
-                                               split=splits[0])
-                else:
-                    raise ValueError(f"Could not find a valid split '{split}' for the dataset")
+class CIFAREvalDataset(Dataset):
+    """CIFAR dataset for evaluation (labeled)"""
+    def __init__(self, dataset_name="cifar10", root="./data", train=False, transform=None):
+        """
+        Args:
+            dataset_name: "cifar10" or "cifar100"
+            root: Root directory for CIFAR data
+            train: Use training split (True) or test split (False)
+            transform: Transform to apply to images
+        """
+        print(f"Loading {dataset_name.upper()} evaluation dataset...")
+        
+        if dataset_name.lower() == "cifar10":
+            self.dataset = CIFAR10(root=root, train=train, download=True, transform=None)
+        elif dataset_name.lower() == "cifar100":
+            self.dataset = CIFAR100(root=root, train=train, download=True, transform=None)
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}. Use 'cifar10' or 'cifar100'")
         
         self.transform = transform
-        print(f"Loaded {len(self.dataset)} evaluation images")
+        print(f"  Loaded {len(self.dataset):,} images")
     
     def __getitem__(self, idx):
-        item = self.dataset[idx]
-        image = item["image"]
-        label = item.get("label", -1)  # Default to -1 if no label
+        image, label = self.dataset[idx]
         
         if self.transform:
             image = self.transform(image)
@@ -784,3 +707,4 @@ class EvalDataset(Dataset):
     
     def __len__(self):
         return len(self.dataset)
+
