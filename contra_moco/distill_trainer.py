@@ -1488,11 +1488,13 @@ def train_moco(model, train_loader, num_epochs, device,
         total_loss = 0.0
         num_batches = 0
         
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        
         # Augmentation sanity check (once, at the very start of training)
         if epoch == start_epoch:
             print("\n🔍 Augmentation Sanity Check:")
             print("  Verifying that im_q and im_k are genuinely different views...")
-            # Get first batch
+            # Get first batch from a fresh iterator (don't consume progress_bar)
             first_batch = next(iter(train_loader))
             if isinstance(first_batch, (tuple, list)) and len(first_batch) == 2:
                 im_q_check = first_batch[0][:4].to(device)  # First 4 samples
