@@ -395,6 +395,7 @@ class MoCoViT(nn.Module):
         # Each column is a key vector, so normalize along dim=0 (across proj_dim for each column)
         self.register_buffer("queue", torch.randn(proj_dim, queue_size))
         self.queue = F.normalize(self.queue, dim=0)  # Normalize each key vector (column) to unit norm
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         
         self.momentum = momentum
         self.temperature = temperature
@@ -1569,6 +1570,7 @@ def train_moco(model, train_loader, num_epochs, device,
                     pos_sim = (q_norm * k_norm).sum(dim=-1).mean().item()
                     
                     # Compute average negative similarity (q · queue) - should stay low
+                    batch_size = q_norm.shape[0]  # Get batch size from features
                     if model.use_queue:
                         neg_sim = (q_norm @ model.queue).mean().item()
                     else:
