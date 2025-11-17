@@ -1412,9 +1412,9 @@ def train_moco(model, train_loader, num_epochs, device,
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Batch should be (view1, view2) tuple or list
-            # DataLoader may convert tuple to list during collation
-            if (isinstance(batch, (tuple, list)) and len(batch) == 2):
+            # Batch should be (view1, view2) tuple of tensors
+            # Custom collate function ensures this structure
+            if isinstance(batch, (tuple, list)) and len(batch) == 2:
                 im_q = batch[0].to(device, non_blocking=True)
                 im_k = batch[1].to(device, non_blocking=True)
             else:
@@ -1448,6 +1448,38 @@ def train_moco(model, train_loader, num_epochs, device,
             total_loss += loss.item()
             num_batches += 1
             global_step += 1
+            
+            # Periodic diagnostics (every 50 batches or first batch of first 5 epochs)
+            if (batch_idx % 50 == 0) or (epoch < 5 and batch_idx == 0):
+                with torch.no_grad():
+                    # Extract features for diagnostics (recompute to avoid modifying forward_moco)
+                    q_features = model._extract_cls_features(model.encoder_q, im_q)
+                    q = model.proj_q(q_features)
+                    q_norm = F.normalize(q, dim=-1)
+                    
+                    k_features = model._extract_cls_features(model.encoder_k, im_k)
+                    k = model.proj_k(k_features)
+                    k_norm = F.normalize(k, dim=-1)
+                    
+                    # Compute positive similarity (q · k) - should increase during training
+                    pos_sim = (q_norm * k_norm).sum(dim=-1).mean().item()
+                    
+                    # Compute average negative similarity (q · queue) - should stay low
+                    neg_sim = (q_norm @ model.queue).mean().item()
+                    
+                    # Compute feature diversity (pairwise similarity of q) - should be moderate (0.1-0.5)
+                    q_pairwise_sim = (q_norm @ q_norm.T).mean().item()
+                    
+                    print(f"\n🔍 MoCo Diagnostics (epoch {epoch+1}, batch {batch_idx}):")
+                    print(f"  Positive similarity (q·k): {pos_sim:.4f} (should increase, target >0.7)")
+                    print(f"  Negative similarity (q·queue): {neg_sim:.4f} (should stay low, target <0.1)")
+                    print(f"  Query diversity (q pairwise sim): {q_pairwise_sim:.4f} (should be 0.1-0.5)")
+                    if q_pairwise_sim > 0.9:
+                        print(f"  ⚠️  WARNING: Features are collapsing!")
+                    elif q_pairwise_sim < 0.05:
+                        print(f"  ⚠️  WARNING: Features are over-dispersed!")
+                    else:
+                        print(f"  ✓ Features have good diversity")
             
             # Update progress bar
             progress_bar.set_postfix({

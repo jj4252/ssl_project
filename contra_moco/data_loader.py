@@ -156,6 +156,24 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     # For MoCo-v3, drop_last=True is important for queue management
     drop_last = (training_mode == "moco_v3" or use_moco_aug)
     
+    # Custom collate function for two-view batches
+    def collate_two_views(batch):
+        """Collate function for batches that return (view1, view2) tuples"""
+        if isinstance(batch[0], tuple) and len(batch[0]) == 2:
+            # Batch is list of (view1, view2) tuples
+            # Collate into (batch_view1, batch_view2) tuple of tensors
+            view1_list = [item[0] for item in batch]
+            view2_list = [item[1] for item in batch]
+            view1_batch = torch.stack(view1_list)
+            view2_batch = torch.stack(view2_list)
+            return (view1_batch, view2_batch)
+        else:
+            # Fallback to default collate
+            return torch.utils.data.default_collate(batch)
+    
+    # Use custom collate for MoCo-v3 (two views)
+    collate_fn = collate_two_views if (training_mode == "moco_v3" or use_moco_aug) else None
+    
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=train_config['batch_size'],
@@ -164,7 +182,8 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         pin_memory=pin_memory,
         drop_last=drop_last,
         persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor
+        prefetch_factor=prefetch_factor,
+        collate_fn=collate_fn
     )
     
     return loader
