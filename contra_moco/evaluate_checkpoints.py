@@ -785,6 +785,38 @@ def main():
             
             state_dict = load_checkpoint(checkpoint_path, device, mode=args.mode)
             
+            # ============================================================
+            # DIAGNOSTIC: Checkpoint loading verification (MoCo-v3)
+            # ============================================================
+            if args.mode == 'moco_v3':
+                print(f"\n🔬 DIAGNOSTIC: MoCo-v3 Checkpoint Loading")
+                # Load full checkpoint to inspect structure
+                full_checkpoint = torch.load(checkpoint_path, map_location=device)
+                print(f"  Checkpoint keys: {list(full_checkpoint.keys())}")
+                
+                if 'encoder_q' in full_checkpoint:
+                    encoder_q_keys = list(full_checkpoint['encoder_q'].keys())[:5]
+                    print(f"  encoder_q keys (first 5): {encoder_q_keys}")
+                    print(f"  encoder_q total keys: {len(full_checkpoint['encoder_q'])}")
+                
+                if 'proj_q' in full_checkpoint:
+                    proj_q_keys = list(full_checkpoint['proj_q'].keys())
+                    print(f"  proj_q keys: {proj_q_keys}")
+                
+                # Verify state_dict matches model
+                model_keys = set(student.state_dict().keys())
+                checkpoint_keys = set(state_dict.keys())
+                
+                missing_in_checkpoint = model_keys - checkpoint_keys
+                extra_in_checkpoint = checkpoint_keys - model_keys
+                
+                if missing_in_checkpoint:
+                    print(f"  ⚠️  Model keys missing in checkpoint (first 5): {list(missing_in_checkpoint)[:5]}")
+                if extra_in_checkpoint:
+                    print(f"  ⚠️  Extra keys in checkpoint (first 5): {list(extra_in_checkpoint)[:5]}")
+                if not missing_in_checkpoint and not extra_in_checkpoint:
+                    print(f"  ✓ All model keys match checkpoint keys")
+            
             # Debug: print checkpoint keys
             if checkpoint_name == list(checkpoints.keys())[0]:  # Only for first checkpoint
                 print(f"  Debug: Checkpoint keys (first 10): {list(state_dict.keys())[:10]}")
@@ -809,6 +841,131 @@ def main():
                     print(f"  ⚠️  Loaded with mismatched keys - model may not work correctly")
             
             student.eval()
+            
+            # ============================================================
+            # DIAGNOSTIC: Check if model parameters actually changed
+            # ============================================================
+            if args.mode == 'moco_v3' and args.eval_untrained:
+                print(f"\n{'='*60}")
+                print("🔬 DIAGNOSTIC: Parameter Change Analysis (MoCo-v3)")
+                print(f"{'='*60}")
+                
+                # Build fresh untrained model for comparison
+                untrained_for_diag = build_student_model(model_config, device)
+                untrained_for_diag.eval()
+                
+                # Compare key parameters
+                print("Comparing key parameters between untrained and trained models:")
+                param_changes = []
+                total_params = 0
+                changed_params = 0
+                
+                trained_params = dict(student.named_parameters())
+                untrained_params = dict(untrained_for_diag.named_parameters())
+                
+                # Check first few layers (most likely to change)
+                key_layers = [
+                    'patch_embed.proj.weight',
+                    'patch_embed.proj.bias',
+                    'blocks.0.norm1.weight',
+                    'blocks.0.attn.qkv.weight',
+                    'blocks.0.attn.proj.weight',
+                    'blocks.0.mlp.fc1.weight',
+                    'blocks.0.mlp.fc2.weight',
+                ]
+                
+                for layer_name in key_layers:
+                    if layer_name in trained_params and layer_name in untrained_params:
+                        trained_param = trained_params[layer_name]
+                        untrained_param = untrained_params[layer_name]
+                        
+                        # Compute statistics
+                        mean_diff = (trained_param - untrained_param).abs().mean().item()
+                        max_diff = (trained_param - untrained_param).abs().max().item()
+                        param_norm_trained = trained_param.norm().item()
+                        param_norm_untrained = untrained_param.norm().item()
+                        
+                        param_changes.append({
+                            'layer': layer_name,
+                            'mean_diff': mean_diff,
+                            'max_diff': max_diff,
+                            'norm_trained': param_norm_trained,
+                            'norm_untrained': param_norm_untrained,
+                            'relative_change': mean_diff / (param_norm_untrained + 1e-8)
+                        })
+                
+                # Check all parameters
+                for name in trained_params.keys():
+                    if name in untrained_params:
+                        total_params += 1
+                        diff = (trained_params[name] - untrained_params[name]).abs().mean().item()
+                        if diff > 1e-6:  # Threshold for "changed"
+                            changed_params += 1
+                
+                # Print results
+                print(f"\n  Overall Statistics:")
+                print(f"    Total parameters checked: {total_params}")
+                print(f"    Parameters that changed (diff > 1e-6): {changed_params} ({100*changed_params/total_params:.1f}%)")
+                
+                print(f"\n  Key Layer Analysis:")
+                for change_info in param_changes:
+                    print(f"    {change_info['layer']}:")
+                    print(f"      Mean absolute diff: {change_info['mean_diff']:.8f}")
+                    print(f"      Max absolute diff: {change_info['max_diff']:.8f}")
+                    print(f"      Norm (untrained): {change_info['norm_untrained']:.6f}")
+                    print(f"      Norm (trained): {change_info['norm_trained']:.6f}")
+                    print(f"      Relative change: {change_info['relative_change']*100:.4f}%")
+                    
+                    if change_info['mean_diff'] < 1e-6:
+                        print(f"      ⚠️  WARNING: This layer didn't change!")
+                    elif change_info['relative_change'] < 0.001:
+                        print(f"      ⚠️  WARNING: Very small relative change (<0.1%)")
+                
+                # Check if model collapsed (all parameters very similar)
+                if changed_params / total_params < 0.1:
+                    print(f"\n  ⚠️  CRITICAL: Less than 10% of parameters changed!")
+                    print(f"      This suggests the model may not have learned anything.")
+                elif changed_params / total_params < 0.5:
+                    print(f"\n  ⚠️  WARNING: Less than 50% of parameters changed.")
+                    print(f"      This may indicate partial learning or early stopping.")
+                else:
+                    print(f"\n  ✓ Most parameters changed - model appears to have learned.")
+                
+                # Clean up
+                del untrained_for_diag
+                torch.cuda.empty_cache() if device.type == 'cuda' else None
+            
+            # ============================================================
+            # DIAGNOSTIC: Model state verification
+            # ============================================================
+            print(f"\n🔬 DIAGNOSTIC: Model State Verification")
+            print(f"  Model is in eval mode: {not student.training}")
+            print(f"  Device: {next(student.parameters()).device}")
+            print(f"  Dtype: {next(student.parameters()).dtype}")
+            
+            # Check if model has dropout (should be disabled in eval)
+            has_dropout = False
+            for name, module in student.named_modules():
+                if 'dropout' in name.lower() or isinstance(module, torch.nn.Dropout):
+                    has_dropout = True
+                    print(f"  Found dropout layer: {name} (p={module.p if hasattr(module, 'p') else 'N/A'})")
+            if not has_dropout:
+                print(f"  No dropout layers found (expected for ViT)")
+            
+            # For MoCo-v3: Verify encoder_q structure
+            if args.mode == 'moco_v3':
+                print(f"\n  MoCo-v3 Specific Checks:")
+                # Check if we can access forward_features
+                try:
+                    test_input = torch.randn(1, 3, model_config['student_img_size'], 
+                                           model_config['student_img_size']).to(device)
+                    with torch.no_grad():
+                        test_output = student.forward_features(test_input)
+                    print(f"    ✓ forward_features() works correctly")
+                    print(f"    Output shape: {test_output.shape if isinstance(test_output, torch.Tensor) else 'dict'}")
+                except Exception as e:
+                    print(f"    ❌ ERROR: forward_features() failed: {e}")
+            
         except RuntimeError as e:
             error_msg = str(e)
             if "corrupted" in error_msg.lower() or "zip archive" in error_msg.lower() or "central directory" in error_msg.lower():
@@ -830,6 +987,86 @@ def main():
         print(f"🔍 Extracting training features...")
         train_features, train_labels = extract_features(student, train_loader, device, use_cls_token=use_cls_token)
         print(f"  Train features shape: {train_features.shape}")
+        
+        # ============================================================
+        # DIAGNOSTIC: Compare features between untrained and trained
+        # ============================================================
+        if args.mode == 'moco_v3' and args.eval_untrained and 'untrained' in results:
+            print(f"\n{'='*60}")
+            print("🔬 DIAGNOSTIC: Feature Comparison (Untrained vs Trained)")
+            print(f"{'='*60}")
+            
+            # Get untrained features (already computed)
+            # We need to extract them again for the same samples, or compare statistics
+            # For now, compare on a small subset
+            print("  Comparing features on first 1000 training samples...")
+            
+            # Get subset of training data
+            subset_indices = list(range(min(1000, len(train_dataset))))
+            subset_dataset = torch.utils.data.Subset(train_dataset, subset_indices)
+            subset_loader = DataLoader(
+                subset_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=0,  # Use 0 workers for small subset
+                pin_memory=False
+            )
+            
+            # Extract features from trained model
+            trained_subset_features, _ = extract_features(student, subset_loader, device, use_cls_token=use_cls_token)
+            
+            # Extract features from untrained model
+            untrained_for_feat = build_student_model(model_config, device)
+            untrained_for_feat.eval()
+            untrained_subset_features, _ = extract_features(untrained_for_feat, subset_loader, device, use_cls_token=use_cls_token)
+            
+            # Compare statistics
+            print(f"\n  Feature Statistics Comparison:")
+            print(f"    Trained features:")
+            print(f"      Mean: {trained_subset_features.mean().item():.6f}")
+            print(f"      Std: {trained_subset_features.std().item():.6f}")
+            print(f"      Min: {trained_subset_features.min().item():.6f}")
+            print(f"      Max: {trained_subset_features.max().item():.6f}")
+            print(f"    Untrained features:")
+            print(f"      Mean: {untrained_subset_features.mean().item():.6f}")
+            print(f"      Std: {untrained_subset_features.std().item():.6f}")
+            print(f"      Min: {untrained_subset_features.min().item():.6f}")
+            print(f"      Max: {untrained_subset_features.max().item():.6f}")
+            
+            # Compute pairwise similarity for both
+            sample_size = min(100, len(trained_subset_features))
+            trained_sim = (trained_subset_features[:sample_size] @ trained_subset_features[:sample_size].T).mean().item()
+            untrained_sim = (untrained_subset_features[:sample_size] @ untrained_subset_features[:sample_size].T).mean().item()
+            
+            print(f"\n  Pairwise Similarity (first {sample_size} samples):")
+            print(f"    Trained: {trained_sim:.6f}")
+            print(f"    Untrained: {untrained_sim:.6f}")
+            
+            # Compute feature difference
+            feature_diff = (trained_subset_features - untrained_subset_features).abs().mean().item()
+            print(f"\n  Mean absolute feature difference: {feature_diff:.6f}")
+            
+            if feature_diff < 1e-4:
+                print(f"    ⚠️  CRITICAL: Features are nearly identical to untrained model!")
+                print(f"        This suggests the model didn't learn meaningful representations.")
+            elif feature_diff < 0.01:
+                print(f"    ⚠️  WARNING: Features are very similar to untrained model.")
+                print(f"        The model may not have learned much.")
+            else:
+                print(f"    ✓ Features differ from untrained model - model appears to have learned.")
+            
+            # Check if trained features are more collapsed than untrained
+            if trained_sim > untrained_sim + 0.1:
+                print(f"\n  ⚠️  WARNING: Trained features are MORE collapsed than untrained!")
+                print(f"      Trained pairwise sim: {trained_sim:.6f}")
+                print(f"      Untrained pairwise sim: {untrained_sim:.6f}")
+                print(f"      This suggests training made features worse!")
+            elif trained_sim < untrained_sim - 0.1:
+                print(f"\n  ✓ Trained features are LESS collapsed than untrained (good!)")
+            
+            # Clean up
+            del untrained_for_feat, trained_subset_features, untrained_subset_features
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
         
         # Analyze feature quality
         feature_stats = analyze_features(train_features, name=f"Checkpoint {checkpoint_name} Features")
