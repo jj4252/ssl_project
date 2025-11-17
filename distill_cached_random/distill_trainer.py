@@ -379,10 +379,11 @@ def barlow_twins_loss(z1: torch.Tensor, z2: torch.Tensor, lambd: float = 5e-3) -
 
 class DistillationLoss(nn.Module):
     """
-    Knowledge distillation loss with learnable projections for dimension mismatch.
+    Knowledge distillation loss with student-side projection to match teacher dimension.
     
-    Handles cases where teacher and student have different embedding dimensions
-    by using learnable linear projections.
+    Instead of projecting teacher features down to student dimension (which can collapse),
+    we project student features up to teacher dimension to match raw DINOv2 features directly.
+    This preserves teacher feature diversity and prevents collapse.
     """
     def __init__(self, teacher_dim=768, student_dim=384, loss_weights=None):
         """
@@ -396,17 +397,17 @@ class DistillationLoss(nn.Module):
         self.student_dim = student_dim
         self.loss_weights = loss_weights if loss_weights else {'cls': 1.0, 'patch': 0.5}
         
-        # Learnable projection layers (only needed if dimensions differ)
+        # Student-side projection layers (only needed if dimensions differ)
+        # Project student features UP to teacher dimension to match raw DINOv2 features
         if teacher_dim != student_dim:
-            self.teacher_proj_cls = nn.Linear(teacher_dim, student_dim, bias=False)
-            self.teacher_proj_patch = nn.Linear(teacher_dim, student_dim, bias=False)
-            # Initialize projections with Xavier uniform (standard for linear layers)
-            # This allows the projection to learn the optimal mapping
-            nn.init.xavier_uniform_(self.teacher_proj_cls.weight)
-            nn.init.xavier_uniform_(self.teacher_proj_patch.weight)
+            self.student_proj_cls = nn.Linear(student_dim, teacher_dim, bias=False)
+            self.student_proj_patch = nn.Linear(student_dim, teacher_dim, bias=False)
+            # Initialize with orthogonal matrix to preserve feature diversity
+            nn.init.orthogonal_(self.student_proj_cls.weight)
+            nn.init.orthogonal_(self.student_proj_patch.weight)
         else:
-            self.teacher_proj_cls = None
-            self.teacher_proj_patch = None
+            self.student_proj_cls = None
+            self.student_proj_patch = None
     
     def forward(self, student_cls, student_patches, teacher_cls, teacher_patches):
         """
@@ -426,15 +427,16 @@ class DistillationLoss(nn.Module):
             self._diagnostic_printed = False
         
         # CLS token loss
-        if self.teacher_proj_cls is not None:
-            # Project teacher to student dimension
-            teacher_cls_proj = self.teacher_proj_cls(teacher_cls)  # [B, D_s]
-            teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)  # [B, D_s] - final target used in loss
+        # Use raw teacher features (frozen, diverse) as target
+        teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # [B, D_t] - raw DINOv2 features
+        
+        # Project student features UP to teacher dimension to match teacher
+        if self.student_proj_cls is not None:
+            student_cls_proj = self.student_proj_cls(student_cls)  # [B, D_t]
+            student_cls_norm = F.normalize(student_cls_proj, dim=-1)  # [B, D_t]
         else:
             # Same dimensions: direct normalization
-            teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # [B, D_t] - final target used in loss
-        
-        student_cls_norm = F.normalize(student_cls, dim=-1)
+            student_cls_norm = F.normalize(student_cls, dim=-1)  # [B, D_s]
         
         # DIAGNOSTIC: Check teacher CLS targets actually used in loss
         if not self._diagnostic_printed:
@@ -456,6 +458,9 @@ class DistillationLoss(nn.Module):
         
         # CLS loss: per-sample cosine, then mean
         # Use F.cosine_similarity for explicit per-sample computation
+        # Note: Both should now be in teacher dimension (D_t)
+        assert student_cls_norm.shape[-1] == teacher_cls_target.shape[-1], \
+            f"Dimension mismatch: student_cls_norm {student_cls_norm.shape[-1]} vs teacher_cls_target {teacher_cls_target.shape[-1]}"
         cosine_sim_cls = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1)  # [B]
         loss_cls = (1.0 - cosine_sim_cls).mean()
         
@@ -471,15 +476,16 @@ class DistillationLoss(nn.Module):
                 student_patches = student_patches[:, :N_t, :]  # Truncate student [B, N_t, D_s]
         
         # Handle dimension mismatch
-        if self.teacher_proj_patch is not None:
-            # Project teacher patches to student dimension
-            teacher_patches_proj = self.teacher_proj_patch(teacher_patches)  # [B, N, D_s]
-            teacher_patches_target = F.normalize(teacher_patches_proj, dim=-1)  # [B, N, D_s] - final target
+        # Use raw teacher patch features (frozen, diverse) as target
+        teacher_patches_target = F.normalize(teacher_patches, dim=-1)  # [B, N, D_t] - raw DINOv2 features
+        
+        # Project student patches UP to teacher dimension to match teacher
+        if self.student_proj_patch is not None:
+            student_patches_proj = self.student_proj_patch(student_patches)  # [B, N, D_t]
+            student_patches_norm = F.normalize(student_patches_proj, dim=-1)  # [B, N, D_t]
         else:
             # Same dimensions: direct normalization
-            teacher_patches_target = F.normalize(teacher_patches, dim=-1)  # [B, N, D_t] - final target
-        
-        student_patches_norm = F.normalize(student_patches, dim=-1)
+            student_patches_norm = F.normalize(student_patches, dim=-1)  # [B, N, D_s]
         
         # DIAGNOSTIC: Check teacher patch targets actually used in loss
         if not self._diagnostic_printed:
@@ -505,7 +511,10 @@ class DistillationLoss(nn.Module):
         
         # PATCHES loss: per-sample, per-patch cosine, then mean
         # Flatten to [B*N, D] for per-patch cosine similarity
+        # Note: Both should now be in teacher dimension (D_t)
         B, N, D = student_patches_norm.shape
+        assert D == teacher_patches_target.shape[-1], \
+            f"Dimension mismatch: student_patches_norm {D} vs teacher_patches_target {teacher_patches_target.shape[-1]}"
         cosine_sim_patch = F.cosine_similarity(
             student_patches_norm.view(-1, D),
             teacher_patches_target.view(-1, D),
@@ -791,17 +800,18 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
                         with torch.no_grad():
                             # Get normalized teacher and student features for debugging
-                            # Check raw teacher features (before projection) for diversity
-                            teacher_cls_raw_norm = F.normalize(teacher_cls, dim=-1)
-                            teacher_raw_pairwise_sim = (teacher_cls_raw_norm @ teacher_cls_raw_norm.T).mean().item()
-                            
-                            # Get projected teacher targets (what student actually matches)
-                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
-                                teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
-                                teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                            # Teacher features are now used directly (no projection)
+                            teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # Raw DINOv2 features
+            
+                            # Student features are projected UP to teacher dimension
+                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'student_proj_cls') and distillation_loss_module.student_proj_cls is not None:
+                                student_cls_proj = distillation_loss_module.student_proj_cls(student_cls)
+                                student_cls_norm = F.normalize(student_cls_proj, dim=-1)
                             else:
-                                teacher_cls_target = F.normalize(teacher_cls, dim=-1)
-                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                                student_cls_norm = F.normalize(student_cls, dim=-1)
+                            
+                            # For diagnostics: teacher is now the same as "raw" (no projection)
+                            teacher_raw_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
                             
                             # Compute statistics
                             teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
@@ -814,8 +824,8 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                             expected_var = 1.0 / teacher_cls_target.shape[-1]  # 1/D for unit-norm vectors
                             
                             print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
-                            print(f"    Teacher RAW pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2)")
-                            print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (after projection)")
+                            print(f"    Teacher pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2, no projection)")
+                            print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (same as raw, no projection)")
                             print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f} (should stay <0.7)")
                             print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f} (should increase)")
                             print(f"    Teacher per-dim variance: {teacher_var:.6f} (expected ~{expected_var:.6f})")
@@ -892,17 +902,18 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
                         with torch.no_grad():
                             # Get normalized teacher and student features for debugging
-                            # Check raw teacher features (before projection) for diversity
-                            teacher_cls_raw_norm = F.normalize(teacher_cls, dim=-1)
-                            teacher_raw_pairwise_sim = (teacher_cls_raw_norm @ teacher_cls_raw_norm.T).mean().item()
-                            
-                            # Get projected teacher targets (what student actually matches)
-                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
-                                teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
-                                teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                            # Teacher features are now used directly (no projection)
+                            teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # Raw DINOv2 features
+            
+                            # Student features are projected UP to teacher dimension
+                            if distillation_loss_module is not None and hasattr(distillation_loss_module, 'student_proj_cls') and distillation_loss_module.student_proj_cls is not None:
+                                student_cls_proj = distillation_loss_module.student_proj_cls(student_cls)
+                                student_cls_norm = F.normalize(student_cls_proj, dim=-1)
                             else:
-                                teacher_cls_target = F.normalize(teacher_cls, dim=-1)
-                            student_cls_norm = F.normalize(student_cls, dim=-1)
+                                student_cls_norm = F.normalize(student_cls, dim=-1)
+                            
+                            # For diagnostics: teacher is now the same as "raw" (no projection)
+                            teacher_raw_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
                             
                             # Compute statistics
                             teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
@@ -915,8 +926,8 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                             expected_var = 1.0 / teacher_cls_target.shape[-1]  # 1/D for unit-norm vectors
                             
                             print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
-                            print(f"    Teacher RAW pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2)")
-                            print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (after projection)")
+                            print(f"    Teacher pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2, no projection)")
+                            print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (same as raw, no projection)")
                             print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f} (should stay <0.7)")
                             print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f} (should increase)")
                             print(f"    Teacher per-dim variance: {teacher_var:.6f} (expected ~{expected_var:.6f})")
@@ -993,17 +1004,18 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
             if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
                 with torch.no_grad():
                     # Get normalized teacher and student features for debugging
-                    # Check raw teacher features (before projection) for diversity
-                    teacher_cls_raw_norm = F.normalize(teacher_cls, dim=-1)
-                    teacher_raw_pairwise_sim = (teacher_cls_raw_norm @ teacher_cls_raw_norm.T).mean().item()
-                    
-                    # Get projected teacher targets (what student actually matches)
-                    if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
-                        teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
-                        teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
+                    # Teacher features are now used directly (no projection)
+                    teacher_cls_target = F.normalize(teacher_cls, dim=-1)  # Raw DINOv2 features
+            
+                    # Student features are projected UP to teacher dimension
+                    if distillation_loss_module is not None and hasattr(distillation_loss_module, 'student_proj_cls') and distillation_loss_module.student_proj_cls is not None:
+                        student_cls_proj = distillation_loss_module.student_proj_cls(student_cls)
+                        student_cls_norm = F.normalize(student_cls_proj, dim=-1)
                     else:
-                        teacher_cls_target = F.normalize(teacher_cls, dim=-1)
-                    student_cls_norm = F.normalize(student_cls, dim=-1)
+                        student_cls_norm = F.normalize(student_cls, dim=-1)
+                    
+                    # For diagnostics: teacher is now the same as "raw" (no projection)
+                    teacher_raw_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
                     
                     # Compute statistics
                     teacher_pairwise_sim = (teacher_cls_target @ teacher_cls_target.T).mean().item()
@@ -1175,15 +1187,18 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         print("✓ Student model compiled successfully")
         print("  ⚠️  Teacher is NOT compiled (frozen, no benefit)")
     
-    # Create distillation loss module with learnable projections
+    # Create distillation loss module with student-side projection
     # Teacher (DINOv2 ViT-B): 768 dims, Student (ViT-S): 384 dims
+    # NEW: Project student UP to teacher dimension (384→768) to match raw DINOv2 features
+    # This prevents teacher feature collapse that occurred with teacher-side projection
     distillation_loss_module = DistillationLoss(
         teacher_dim=768,
         student_dim=384,
         loss_weights=loss_weights
     ).to(device)
-    print("✓ Created DistillationLoss module with learnable projections (768→384)")
-    print("  ✓ Projection layers are TRAINABLE (will learn optimal 768→384 mapping)")
+    print("✓ Created DistillationLoss module with student-side projection (384→768)")
+    print("  ✓ Student features projected UP to match raw DINOv2 features (preserves teacher diversity)")
+    print("  ✓ Projection layers are TRAINABLE (will learn optimal 384→768 mapping)")
     
     # Create SSL projection head if SSL is enabled
     student_projection_head = None
