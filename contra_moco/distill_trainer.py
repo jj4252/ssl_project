@@ -1470,6 +1470,35 @@ def train_moco(model, train_loader, num_epochs, device,
         checkpoint = torch.load(resume_from, map_location=device)
         model.encoder_q.load_state_dict(checkpoint['encoder_q'])
         model.proj_q.load_state_dict(checkpoint['proj_q'])
+        # Load momentum encoder and projection (if available, for backward compatibility)
+        if 'encoder_k' in checkpoint:
+            model.encoder_k.load_state_dict(checkpoint['encoder_k'])
+        else:
+            # Backward compatibility: copy from encoder_q if not saved
+            print("  ⚠️  Warning: encoder_k not found in checkpoint, copying from encoder_q")
+            for param_q, param_k in zip(model.encoder_q.parameters(), model.encoder_k.parameters()):
+                param_k.data.copy_(param_q.data)
+        
+        if 'proj_k' in checkpoint:
+            model.proj_k.load_state_dict(checkpoint['proj_k'])
+        else:
+            # Backward compatibility: copy from proj_q if not saved
+            print("  ⚠️  Warning: proj_k not found in checkpoint, copying from proj_q")
+            for param_q, param_k in zip(model.proj_q.parameters(), model.proj_k.parameters()):
+                param_k.data.copy_(param_q.data)
+        
+        # Load MoCo queue state (if available, for backward compatibility)
+        if 'queue' in checkpoint:
+            model.queue.copy_(checkpoint['queue'])
+        else:
+            print("  ⚠️  Warning: queue not found in checkpoint, using random initialization")
+        
+        if 'queue_ptr' in checkpoint:
+            model.queue_ptr.copy_(checkpoint['queue_ptr'])
+        else:
+            print("  ⚠️  Warning: queue_ptr not found in checkpoint, resetting to 0")
+            model.queue_ptr.zero_()
+        
         if 'optimizer' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
         if 'scheduler' in checkpoint:
@@ -1637,6 +1666,10 @@ def train_moco(model, train_loader, num_epochs, device,
                 checkpoint = {
                     'encoder_q': model.encoder_q.state_dict(),
                     'proj_q': model.proj_q.state_dict(),
+                    'encoder_k': model.encoder_k.state_dict(),  # Save momentum encoder
+                    'proj_k': model.proj_k.state_dict(),         # Save momentum projection
+                    'queue': model.queue,                        # Save MoCo queue buffer
+                    'queue_ptr': model.queue_ptr,                # Save queue pointer
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
@@ -1659,6 +1692,10 @@ def train_moco(model, train_loader, num_epochs, device,
             checkpoint = {
                 'encoder_q': model.encoder_q.state_dict(),
                 'proj_q': model.proj_q.state_dict(),
+                'encoder_k': model.encoder_k.state_dict(),  # Save momentum encoder
+                'proj_k': model.proj_k.state_dict(),         # Save momentum projection
+                'queue': model.queue,                        # Save MoCo queue buffer
+                'queue_ptr': model.queue_ptr,                 # Save queue pointer
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
