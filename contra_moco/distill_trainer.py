@@ -392,18 +392,33 @@ class MoCoViT(nn.Module):
             param_k.requires_grad = False
         
         # MoCo queue: [proj_dim, queue_size]
+        # Each column is a key vector, so normalize along dim=0 (across proj_dim for each column)
         self.register_buffer("queue", torch.randn(proj_dim, queue_size))
-        self.queue = F.normalize(self.queue, dim=0)
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+        self.queue = F.normalize(self.queue, dim=0)  # Normalize each key vector (column) to unit norm
         
         self.momentum = momentum
         self.temperature = temperature
         self.queue_size = queue_size
         self.proj_dim = proj_dim
+        self.use_queue = True  # Can disable queue for batch-only contrastive learning (debugging)
     
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
-        """EMA update: k = m*k + (1-m)*q"""
+        """
+        EMA update: param_k = m * param_k + (1-m) * param_q
+        
+        CRITICAL: encoder_k and proj_k must have requires_grad=False
+        """
+        # Verify encoder_k is frozen (no gradients)
+        for name, param_k in self.encoder_k.named_parameters():
+            assert not param_k.requires_grad, \
+                f"CRITICAL: encoder_k.{name} has requires_grad=True! Key encoder must be frozen."
+        
+        for name, param_k in self.proj_k.named_parameters():
+            assert not param_k.requires_grad, \
+                f"CRITICAL: proj_k.{name} has requires_grad=True! Key projection must be frozen."
+        
+        # EMA update: param_k = m * param_k + (1-m) * param_q
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
         
@@ -416,16 +431,25 @@ class MoCoViT(nn.Module):
         """
         Update the queue with new keys.
         
+        CRITICAL: Must receive k (key vectors), NEVER q (query vectors)!
+        
         Args:
-            keys: [B, proj_dim], already normalized
+            keys: [B, proj_dim], should be normalized key vectors (k), not query vectors (q)
         """
         batch_size = keys.shape[0]
         ptr = int(self.queue_ptr)
         
+        # CRITICAL VERIFICATION: Ensure keys are detached (no gradients)
+        assert not keys.requires_grad, \
+            "CRITICAL: Keys must be detached before enqueueing! Use k, not q, and ensure it's in no_grad context."
+        
+        # Ensure keys are normalized (safety check)
+        keys = F.normalize(keys, dim=-1)
+        
         # Replace entries in [ptr : ptr + batch_size]
         end = ptr + batch_size
         if end <= self.queue_size:
-            self.queue[:, ptr:end] = keys.T
+            self.queue[:, ptr:end] = keys.T  # [proj_dim, batch_size]
         else:
             # Wrap around
             first = self.queue_size - ptr
@@ -459,6 +483,10 @@ class MoCoViT(nn.Module):
         """
         batch_size = im_q.shape[0]
         
+        # Assertions for debugging
+        assert im_q.shape == im_k.shape, f"im_q and im_k must have same shape, got {im_q.shape} vs {im_k.shape}"
+        assert batch_size > 0, "Batch size must be positive"
+        
         # -----------------
         # Query branch
         # -----------------
@@ -470,7 +498,7 @@ class MoCoViT(nn.Module):
         # Key branch (with momentum update)
         # -----------------
         with torch.no_grad():
-            # Update momentum encoder
+            # Update momentum encoder (EMA update)
             self._momentum_update_key_encoder()
             
             # Forward through momentum encoder
@@ -482,26 +510,77 @@ class MoCoViT(nn.Module):
         # Compute logits
         # -----------------
         # Positive: q · k+ (same index in batch)
+        # Element-wise dot product: [B] -> [B, 1]
         logits_pos = torch.einsum("bd,bd->b", [q, k]).unsqueeze(-1)  # [B, 1]
         
-        # Negative: q · queue
-        logits_neg = torch.einsum("bd,dk->bk", [q, self.queue.clone().detach()])  # [B, queue_size]
-        
-        # Concatenate: [B, 1 + queue_size]
-        logits = torch.cat([logits_pos, logits_neg], dim=1)
+        if self.use_queue:
+            # Negative: q · queue
+            # q: [B, proj_dim], queue: [proj_dim, queue_size]
+            # Result: [B, queue_size]
+            logits_neg = torch.einsum("bd,dk->bk", [q, self.queue])  # [B, queue_size]
+            
+            # Concatenate: [B, 1 + queue_size]
+            # Positive is at index 0, negatives at indices 1:queue_size+1
+            logits = torch.cat([logits_pos, logits_neg], dim=1)
+            
+            # Assertion: verify positive is at index 0
+            assert logits.shape == (batch_size, 1 + self.queue_size), \
+                f"Logits shape mismatch: expected {(batch_size, 1 + self.queue_size)}, got {logits.shape}"
+        else:
+            # Batch-only contrastive learning (for debugging)
+            # Use other samples in the batch as negatives
+            # q: [B, proj_dim], k: [B, proj_dim]
+            # Compute all pairwise similarities: [B, B]
+            logits_all = torch.einsum("bd,cd->bc", [q, k])  # [B, B]
+            
+            # Positive is on diagonal, negatives are off-diagonal
+            # Extract positive (diagonal) and negatives (off-diagonal)
+            # For each sample, positive is at its own index, negatives are all others
+            # We'll use a mask to set positive to a high value and negatives to low values
+            # Actually, simpler: use logits_all directly, with targets as diagonal indices
+            logits = logits_all  # [B, B]
+            
+            # Targets: diagonal indices (0, 1, 2, ..., B-1)
+            targets = torch.arange(batch_size, dtype=torch.long, device=logits.device)
         
         # Apply temperature
-        logits /= self.temperature
+        logits = logits / self.temperature
         
-        # Targets: all positives are at index 0
-        targets = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
+        # Set targets based on mode
+        if not self.use_queue:
+            # For batch-only mode, targets are already set above (diagonal indices)
+            pass
+        else:
+            # Targets: all positives are at index 0
+            targets = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
+        
+        # CRITICAL VERIFICATION: Assert logits[:,0] is positive (q·k) and labels are correct
+        if self.use_queue:
+            # Verify positive logits are at index 0
+            assert torch.allclose(logits[:, 0], logits_pos.squeeze(-1) / self.temperature), \
+                "CRITICAL: Positive logits must be at index 0!"
+            # Verify targets are all zeros (positive at index 0)
+            assert torch.all(targets == 0), \
+                "CRITICAL: All targets must be 0 (positive at index 0)!"
+            # Runtime check: positive should be larger than negatives (after some training)
+            # This is a sanity check that will warn if the model is learning backwards
+            if hasattr(self, '_check_pos_neg_ratio'):
+                pos_mean = logits[:, 0].mean().item()
+                neg_mean = logits[:, 1:].mean().item()
+                if pos_mean <= neg_mean:
+                    print(f"⚠️  WARNING: Positive logits ({pos_mean:.4f}) <= Negative logits ({neg_mean:.4f})!")
+                    print(f"    This suggests the model is learning backwards - check augmentations/labels!")
         
         # InfoNCE loss
         loss = F.cross_entropy(logits, targets)
         
-        # Update queue with new keys
-        with torch.no_grad():
-            self._dequeue_and_enqueue(k)
+        # Update queue with new keys (detached, normalized) - only if using queue
+        # CRITICAL: Must use k (key), NEVER q (query)
+        if self.use_queue:
+            with torch.no_grad():
+                # Explicitly verify we're enqueueing k, not q
+                assert k.requires_grad == False, "k must be detached before enqueueing!"
+                self._dequeue_and_enqueue(k)  # k is the key, q is the query - NEVER enqueue q!
         
         return loss
 
@@ -1409,7 +1488,30 @@ def train_moco(model, train_loader, num_epochs, device,
         total_loss = 0.0
         num_batches = 0
         
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        # Augmentation sanity check (once, at the very start of training)
+        if epoch == start_epoch:
+            print("\n🔍 Augmentation Sanity Check:")
+            print("  Verifying that im_q and im_k are genuinely different views...")
+            # Get first batch
+            first_batch = next(iter(train_loader))
+            if isinstance(first_batch, (tuple, list)) and len(first_batch) == 2:
+                im_q_check = first_batch[0][:4].to(device)  # First 4 samples
+                im_k_check = first_batch[1][:4].to(device)
+                
+                # Compute pixel-wise difference
+                pixel_diff = (im_q_check - im_k_check).abs().mean().item()
+                pixel_std_q = im_q_check.std().item()
+                pixel_std_k = im_k_check.std().item()
+                
+                print(f"  Pixel difference (|im_q - im_k|): {pixel_diff:.6f}")
+                print(f"  im_q std: {pixel_std_q:.6f}, im_k std: {pixel_std_k:.6f}")
+                
+                if pixel_diff < 0.01:
+                    print(f"  ⚠️  CRITICAL: im_q and im_k are nearly identical! Check augmentations!")
+                elif pixel_diff < 0.05:
+                    print(f"  ⚠️  WARNING: im_q and im_k are very similar - augmentations may be too weak")
+                else:
+                    print(f"  ✓ Augmentations are producing different views")
         
         for batch_idx, batch in enumerate(progress_bar):
             # Batch should be (view1, view2) tuple of tensors
@@ -1465,21 +1567,59 @@ def train_moco(model, train_loader, num_epochs, device,
                     pos_sim = (q_norm * k_norm).sum(dim=-1).mean().item()
                     
                     # Compute average negative similarity (q · queue) - should stay low
-                    neg_sim = (q_norm @ model.queue).mean().item()
+                    if model.use_queue:
+                        neg_sim = (q_norm @ model.queue).mean().item()
+                    else:
+                        # Batch-only mode: use other samples in batch as negatives
+                        neg_sim = (q_norm @ k_norm.T).mean().item() - pos_sim / batch_size  # Approximate off-diagonal mean
                     
                     # Compute feature diversity (pairwise similarity of q) - should be moderate (0.1-0.5)
                     q_pairwise_sim = (q_norm @ q_norm.T).mean().item()
                     
+                    # Per-dimension variance (should be ~1/D for healthy features)
+                    q_var = q_norm.var(dim=0).mean().item()
+                    expected_var = 1.0 / q_norm.shape[-1]  # 1/D for unit-norm vectors
+                    
+                    # Runtime check: positive should be larger than negatives
+                    # This verifies the model is learning correctly
+                    if model.use_queue:
+                        # Recompute logits for verification
+                        logits_pos_check = (q_norm * k_norm).sum(dim=-1, keepdim=True)  # [B, 1]
+                        logits_neg_check = q_norm @ model.queue  # [B, queue_size]
+                        pos_mean = logits_pos_check.mean().item()
+                        neg_mean = logits_neg_check.mean().item()
+                        pos_neg_ratio = pos_mean / (neg_mean + 1e-8)
+                    else:
+                        pos_mean = pos_sim
+                        neg_mean = neg_sim
+                        pos_neg_ratio = pos_mean / (neg_mean + 1e-8)
+                    
                     print(f"\n🔍 MoCo Diagnostics (epoch {epoch+1}, batch {batch_idx}):")
                     print(f"  Positive similarity (q·k): {pos_sim:.4f} (should increase, target >0.7)")
-                    print(f"  Negative similarity (q·queue): {neg_sim:.4f} (should stay low, target <0.1)")
+                    print(f"  Negative similarity (q·{'queue' if model.use_queue else 'batch'}): {neg_sim:.4f} (should stay low, target <0.1)")
+                    print(f"  Pos/Neg ratio: {pos_neg_ratio:.4f} (should be >1.0, ideally >2.0)")
                     print(f"  Query diversity (q pairwise sim): {q_pairwise_sim:.4f} (should be 0.1-0.5)")
+                    print(f"  Query per-dim variance: {q_var:.6f} (expected ~{expected_var:.6f})")
+                    
+                    # Warnings
+                    if pos_neg_ratio < 1.0:
+                        print(f"  ⚠️  CRITICAL: Positive < Negative! Model learning backwards - check labels/augmentations!")
+                    elif pos_neg_ratio < 1.5:
+                        print(f"  ⚠️  WARNING: Pos/Neg ratio is low - model may not be learning contrastive signal well")
+                    
                     if q_pairwise_sim > 0.9:
-                        print(f"  ⚠️  WARNING: Features are collapsing!")
+                        print(f"  ⚠️  WARNING: Features are collapsing! (pairwise sim >0.9)")
                     elif q_pairwise_sim < 0.05:
-                        print(f"  ⚠️  WARNING: Features are over-dispersed!")
+                        print(f"  ⚠️  WARNING: Features are over-dispersed! (pairwise sim <0.05)")
                     else:
                         print(f"  ✓ Features have good diversity")
+                    
+                    if q_var < expected_var * 0.1:
+                        print(f"  ⚠️  WARNING: Per-dim variance is very low (collapse risk)!")
+                    
+                    # Enable runtime pos/neg check for future batches
+                    if not hasattr(model, '_check_pos_neg_ratio'):
+                        model._check_pos_neg_ratio = True
             
             # Update progress bar
             progress_bar.set_postfix({

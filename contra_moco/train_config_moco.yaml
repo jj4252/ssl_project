@@ -15,9 +15,9 @@ min_lr: 1e-6
 # MoCo-v3 specific settings
 moco:
   proj_dim: 256           # Projection head output dimension
-  queue_size: 65536       # Number of negative keys in queue
-  momentum: 0.99          # EMA momentum for key encoder
-  temperature: 0.2        # InfoNCE temperature
+  queue_size: 65536       # Number of negative keys in queue (try 4096 for debugging if collapse persists)
+  momentum: 0.99          # EMA momentum for key encoder (standard: 0.99, can try 0.95-0.999)
+  temperature: 0.2        # InfoNCE temperature (try 0.2, 0.3, 0.5 if collapse persists)
 
 # Data augmentation (MoCo-v3 style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale
