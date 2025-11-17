@@ -43,10 +43,11 @@ save_every: 100  # Save checkpoint every N steps (0 = only at end of epoch)
 
 # SSL (Self-Supervised Learning) configuration
 # Adds Barlow Twins loss on top of KD to improve feature discriminativeness
+# RECOMMENDED: Enable with small weight (0.05) as anti-collapse regularizer
 ssl:
-  enabled: false  # Set to true to enable SSL (Barlow Twins)
+  enabled: true   # Set to true to enable SSL (Barlow Twins) - RECOMMENDED for anti-collapse
   type: "barlow"  # SSL loss type (currently only "barlow" supported)
-  weight: 0.05    # Weight for SSL loss: L_total = L_kd + weight * L_ssl (0.05 recommended, 0.5 was too high)
+  weight: 0.05   # Weight for SSL loss: L_total = L_kd + weight * L_ssl (0.05 recommended, 0.5 was too high)
   barlow_lambd: 0.005  # Lambda for Barlow Twins off-diagonal term (default: 5e-3)
   proj_hidden_dim: 1024  # Hidden dimension for projection head
   proj_out_dim: 256      # Output dimension for projection head

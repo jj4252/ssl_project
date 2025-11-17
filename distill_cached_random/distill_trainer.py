@@ -791,6 +791,11 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
                         with torch.no_grad():
                             # Get normalized teacher and student features for debugging
+                            # Check raw teacher features (before projection) for diversity
+                            teacher_cls_raw_norm = F.normalize(teacher_cls, dim=-1)
+                            teacher_raw_pairwise_sim = (teacher_cls_raw_norm @ teacher_cls_raw_norm.T).mean().item()
+                            
+                            # Get projected teacher targets (what student actually matches)
                             if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
                                 teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
                                 teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
@@ -803,14 +808,29 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                             student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
                             mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
                             
+                            # Per-dimension variance (should be ~1/D for healthy features)
+                            teacher_var = teacher_cls_target.var(dim=0).mean().item()
+                            student_var = student_cls_norm.var(dim=0).mean().item()
+                            expected_var = 1.0 / teacher_cls_target.shape[-1]  # 1/D for unit-norm vectors
+                            
                             print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
-                            print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
-                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
-                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                            print(f"    Teacher RAW pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2)")
+                            print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (after projection)")
+                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f} (should stay <0.7)")
+                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f} (should increase)")
+                            print(f"    Teacher per-dim variance: {teacher_var:.6f} (expected ~{expected_var:.6f})")
+                            print(f"    Student per-dim variance: {student_var:.6f} (expected ~{expected_var:.6f})")
+                            
+                            if teacher_raw_pairwise_sim > 0.9:
+                                print(f"    ⚠️  CRITICAL: Raw teacher features are collapsed! Check data loading.")
+                            elif teacher_raw_pairwise_sim > 0.5:
+                                print(f"    ⚠️  WARNING: Raw teacher features show reduced diversity")
+                            if teacher_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Teacher targets (after projection) are collapsing!")
                             if student_pairwise_sim > 0.9:
                                 print(f"    ⚠️  WARNING: Student features are collapsing!")
-                            if teacher_pairwise_sim > 0.9:
-                                print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
+                            if student_var < expected_var * 0.1:
+                                print(f"    ⚠️  WARNING: Student variance is very low (collapse risk)")
                     
                     # Compute distillation loss
                     loss_kd, metrics = compute_distillation_loss(
@@ -872,6 +892,11 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
                         with torch.no_grad():
                             # Get normalized teacher and student features for debugging
+                            # Check raw teacher features (before projection) for diversity
+                            teacher_cls_raw_norm = F.normalize(teacher_cls, dim=-1)
+                            teacher_raw_pairwise_sim = (teacher_cls_raw_norm @ teacher_cls_raw_norm.T).mean().item()
+                            
+                            # Get projected teacher targets (what student actually matches)
                             if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
                                 teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
                                 teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
@@ -884,14 +909,29 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                             student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
                             mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
                             
+                            # Per-dimension variance (should be ~1/D for healthy features)
+                            teacher_var = teacher_cls_target.var(dim=0).mean().item()
+                            student_var = student_cls_norm.var(dim=0).mean().item()
+                            expected_var = 1.0 / teacher_cls_target.shape[-1]  # 1/D for unit-norm vectors
+                            
                             print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
-                            print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
-                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
-                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                            print(f"    Teacher RAW pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2)")
+                            print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (after projection)")
+                            print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f} (should stay <0.7)")
+                            print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f} (should increase)")
+                            print(f"    Teacher per-dim variance: {teacher_var:.6f} (expected ~{expected_var:.6f})")
+                            print(f"    Student per-dim variance: {student_var:.6f} (expected ~{expected_var:.6f})")
+                            
+                            if teacher_raw_pairwise_sim > 0.9:
+                                print(f"    ⚠️  CRITICAL: Raw teacher features are collapsed! Check data loading.")
+                            elif teacher_raw_pairwise_sim > 0.5:
+                                print(f"    ⚠️  WARNING: Raw teacher features show reduced diversity")
+                            if teacher_pairwise_sim > 0.9:
+                                print(f"    ⚠️  WARNING: Teacher targets (after projection) are collapsing!")
                             if student_pairwise_sim > 0.9:
                                 print(f"    ⚠️  WARNING: Student features are collapsing!")
-                            if teacher_pairwise_sim > 0.9:
-                                print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
+                            if student_var < expected_var * 0.1:
+                                print(f"    ⚠️  WARNING: Student variance is very low (collapse risk)")
                     
                     # Compute distillation loss
                     loss_kd, metrics = compute_distillation_loss(
@@ -953,6 +993,11 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
             if (batch_idx % 50 == 0 or (batch_idx == 0 and epoch < 5)):
                 with torch.no_grad():
                     # Get normalized teacher and student features for debugging
+                    # Check raw teacher features (before projection) for diversity
+                    teacher_cls_raw_norm = F.normalize(teacher_cls, dim=-1)
+                    teacher_raw_pairwise_sim = (teacher_cls_raw_norm @ teacher_cls_raw_norm.T).mean().item()
+                    
+                    # Get projected teacher targets (what student actually matches)
                     if distillation_loss_module is not None and hasattr(distillation_loss_module, 'teacher_proj_cls') and distillation_loss_module.teacher_proj_cls is not None:
                         teacher_cls_proj = distillation_loss_module.teacher_proj_cls(teacher_cls)
                         teacher_cls_target = F.normalize(teacher_cls_proj, dim=-1)
@@ -965,14 +1010,29 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     student_pairwise_sim = (student_cls_norm @ student_cls_norm.T).mean().item()
                     mean_cosine_st_te = F.cosine_similarity(student_cls_norm, teacher_cls_target, dim=-1).mean().item()
                     
+                    # Per-dimension variance (should be ~1/D for healthy features)
+                    teacher_var = teacher_cls_target.var(dim=0).mean().item()
+                    student_var = student_cls_norm.var(dim=0).mean().item()
+                    expected_var = 1.0 / teacher_cls_target.shape[-1]  # 1/D for unit-norm vectors
+                    
                     print(f"\n  🔍 Debug (epoch {epoch+1}, batch {batch_idx}):")
-                    print(f"    Teacher CLS pairwise sim: {teacher_pairwise_sim:.6f}")
-                    print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f}")
-                    print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f}")
+                    print(f"    Teacher RAW pairwise sim: {teacher_raw_pairwise_sim:.6f} (should be 0.0-0.3 for diverse DINOv2)")
+                    print(f"    Teacher TARGET pairwise sim: {teacher_pairwise_sim:.6f} (after projection)")
+                    print(f"    Student CLS pairwise sim: {student_pairwise_sim:.6f} (should stay <0.7)")
+                    print(f"    Mean cosine(student, teacher): {mean_cosine_st_te:.6f} (should increase)")
+                    print(f"    Teacher per-dim variance: {teacher_var:.6f} (expected ~{expected_var:.6f})")
+                    print(f"    Student per-dim variance: {student_var:.6f} (expected ~{expected_var:.6f})")
+                    
+                    if teacher_raw_pairwise_sim > 0.9:
+                        print(f"    ⚠️  CRITICAL: Raw teacher features are collapsed! Check data loading.")
+                    elif teacher_raw_pairwise_sim > 0.5:
+                        print(f"    ⚠️  WARNING: Raw teacher features show reduced diversity")
+                    if teacher_pairwise_sim > 0.9:
+                        print(f"    ⚠️  WARNING: Teacher targets (after projection) are collapsing!")
                     if student_pairwise_sim > 0.9:
                         print(f"    ⚠️  WARNING: Student features are collapsing!")
-                    if teacher_pairwise_sim > 0.9:
-                        print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
+                    if student_var < expected_var * 0.1:
+                        print(f"    ⚠️  WARNING: Student variance is very low (collapse risk)")
             
             # Compute distillation loss
             loss_kd, metrics = compute_distillation_loss(
@@ -1123,12 +1183,7 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         loss_weights=loss_weights
     ).to(device)
     print("✓ Created DistillationLoss module with learnable projections (768→384)")
-    
-    # FIX: Freeze projection layers to prevent collapse
-    # The projection layers should be fixed, not learnable
-    for name, param in distillation_loss_module.named_parameters():
-        param.requires_grad = False
-        print(f"  ✓ Frozen projection layer: {name}")
+    print("  ✓ Projection layers are TRAINABLE (will learn optimal 768→384 mapping)")
     
     # Create SSL projection head if SSL is enabled
     student_projection_head = None
@@ -1145,11 +1200,20 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
     else:
         print("✓ SSL disabled (no projection head)")
     
-    # Build optimizer: student parameters + projection head (if SSL enabled)
+    # Build optimizer: student parameters + distillation projection layers + projection head (if SSL enabled)
     # Group parameters: weight decay for non-bias/norm, no weight decay for bias/norm
     params_with_wd = []
     params_without_wd = []
+    
+    # Student parameters
     for name, param in student.named_parameters():
+        if any(nd in name for nd in ["bias", "norm", "ln"]):
+            params_without_wd.append(param)
+        else:
+            params_with_wd.append(param)
+    
+    # Distillation loss module parameters (projection layers) - NOW TRAINABLE
+    for name, param in distillation_loss_module.named_parameters():
         if any(nd in name for nd in ["bias", "norm", "ln"]):
             params_without_wd.append(param)
         else:
@@ -1162,8 +1226,6 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
                 params_without_wd.append(param)
             else:
                 params_with_wd.append(param)
-    
-    # DO NOT add distillation_loss_module parameters (they're frozen)
     
     param_groups = [
         {"params": params_with_wd, "weight_decay": weight_decay},
