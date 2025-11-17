@@ -887,9 +887,9 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         
         # Handle batch format: either (view1, view2) for SSL or single image
         # When SSL is enabled, DataLoader collates tuples into (batch_view1, batch_view2)
-        # Check for tuple first (SSL mode returns tuple of two batched views)
-        if isinstance(batch, tuple) and len(batch) == 2:
-            # Two views for SSL (Barlow Twins) - batch is (batch_view1, batch_view2)
+        # DataLoader may convert tuple to list during collation, so check both
+        if (isinstance(batch, (tuple, list)) and len(batch) == 2):
+            # Two views for SSL (Barlow Twins) - batch is (batch_view1, batch_view2) or [batch_view1, batch_view2]
             images_view1 = batch[0].to(device)
             images_view2 = batch[1].to(device)
             images = images_view1  # Use view1 for KD (can also use view2, doesn't matter)
@@ -901,7 +901,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 images = images.to(memory_format=torch.channels_last)
             except:
                 pass
-        elif isinstance(batch, list):
+        elif isinstance(batch, list) and len(batch) > 2:
             # Multi-crop mode or list of crops
             if use_multi_crop:
                 images = batch[0].to(device)  # Use first global crop
@@ -1412,12 +1412,13 @@ def train_moco(model, train_loader, num_epochs, device,
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Batch should be (view1, view2) tuple
-            if isinstance(batch, tuple) and len(batch) == 2:
+            # Batch should be (view1, view2) tuple or list
+            # DataLoader may convert tuple to list during collation
+            if (isinstance(batch, (tuple, list)) and len(batch) == 2):
                 im_q = batch[0].to(device, non_blocking=True)
                 im_k = batch[1].to(device, non_blocking=True)
             else:
-                raise ValueError(f"Expected batch to be tuple of 2 views, got {type(batch)}")
+                raise ValueError(f"Expected batch to be tuple/list of 2 views, got {type(batch)} with length {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
             
             # Convert to channels_last if supported
             try:
