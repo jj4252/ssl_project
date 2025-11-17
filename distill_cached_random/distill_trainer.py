@@ -1217,8 +1217,28 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
     
     # Build optimizer: student parameters + distillation projection layers + projection head (if SSL enabled)
     # Group parameters: weight decay for non-bias/norm, no weight decay for bias/norm
+    # CRITICAL: Ensure all parameters have the same dtype and device
     params_with_wd = []
     params_without_wd = []
+    
+    # Get reference dtype and device from student (in case it's compiled)
+    # Extract from actual parameter to handle compiled models
+    try:
+        ref_param = next(iter(student.parameters()))
+        ref_dtype = ref_param.dtype
+        ref_device = ref_param.device
+    except StopIteration:
+        # Fallback if student has no parameters (shouldn't happen)
+        ref_dtype = torch.float32
+        ref_device = device
+    
+    # Ensure distillation_loss_module parameters match student's dtype and device
+    # Move the entire module to ensure consistency
+    distillation_loss_module = distillation_loss_module.to(device=ref_device, dtype=ref_dtype)
+    
+    # Ensure SSL projection head parameters match student's dtype and device
+    if student_projection_head is not None:
+        student_projection_head = student_projection_head.to(device=ref_device, dtype=ref_dtype)
     
     # Student parameters
     for name, param in student.named_parameters():
