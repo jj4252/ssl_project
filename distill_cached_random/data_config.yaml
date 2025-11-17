@@ -1,35 +1,18 @@
-# Data loading configuration (optimized for random subset sampling per epoch)
+# Data loading configuration for CIFAR-10/100
+# Experiment: Train KD on CIFAR10, evaluate on CIFAR10 (same distribution)
 
-dataset_name: "tsbpp/fall2025_deeplearning"
-image_size: 96  # Match original image size (96x96) - student operates at native resolution
+# Dataset configuration
+dataset_name: "cifar10"  # Options: "cifar10" or "cifar100"
+dataset_root: "./data"  # Root directory for CIFAR data (will download if not present)
+max_samples: null  # null = use full dataset (50K training images for CIFAR10)
+
+# Image size
+# CIFAR10 images are 32x32, will be upscaled to image_size for student
+# Teacher will receive 224x224 (upscaled from student size)
+image_size: 96  # Match student model size (will be upscaled from 32x32)
+
+# DataLoader settings (optimized for Slurm)
 num_workers: 2  # Reduced to prevent OOM
 persistent_workers: false  # Must be false
 prefetch_factor: 1  # Reduced to prevent OOM
 pin_memory: true
-
-# Cache configuration (2-stage pipeline)
-# Auto-detection: If cache exists, it will be used automatically
-# Set to false to explicitly disable cached mode even if cache exists
-use_cached_tensors: null  # null = auto-detect, true = force enable, false = force disable
-cache_root: "/scratch/jj4252/Nov_14_distill/cache_images"  # Root directory for cached tensors
-cache_image_size: 96  # Match original image size (96x96) - no need to cache larger
-cache_dtype: "float32"  # Data type for cached tensors (float32 or float16)
-cache_shard_size: 2048  # Number of samples per shard file
-
-# Random shard-level sampling per epoch (FAST - better cache locality)
-# Instead of randomly sampling individual indices, this randomly picks shard files.
-# For each epoch, randomly pick N shards and use all images from those shards sequentially.
-# This provides much better cache locality and I/O performance than index-level sampling.
-shards_per_epoch: 15  # Number of random shard files to use per epoch (~30K images with 2048 per shard)
-random_subset_seed: 42  # Random seed for shard sampling (for reproducibility)
-
-# Legacy: samples_per_epoch (deprecated - use shards_per_epoch instead)
-# samples_per_epoch: 30000  # Will be converted to shards_per_epoch automatically
-
-# Subset limits for testing (optional - usually not needed with random sampling)
-# max_shards: null  # Limit to first N shard files (for testing)
-# max_samples: null  # Limit by total samples (for testing)
-
-# Legacy compatibility (will be removed)
-use_cached: false  # Deprecated: use use_cached_tensors instead
-cache_dir: "/scratch/jj4252/Nov_14_distill/cache_images"  # Deprecated: use cache_root instead
