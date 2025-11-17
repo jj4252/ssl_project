@@ -59,10 +59,16 @@ class CIFARDataset(Dataset):
         
         if self.transform:
             if self.return_two_views:
-                # Return two augmented views for SSL
-                view1 = self.transform(image)
-                view2 = self.transform(image)  # Apply transform again (stochastic)
-                return view1, view2
+                # Check if transform already returns two views (e.g., MoCoTransform)
+                result = self.transform(image)
+                if isinstance(result, tuple) and len(result) == 2:
+                    # Transform already returns (view1, view2)
+                    return result
+                else:
+                    # Transform returns single view, apply twice for two views
+                    view1 = self.transform(image)
+                    view2 = self.transform(image)  # Apply transform again (stochastic)
+                    return view1, view2
             else:
                 views = self.transform(image)  # Multi-crop returns list
                 return views
