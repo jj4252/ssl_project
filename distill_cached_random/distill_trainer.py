@@ -303,6 +303,80 @@ def extract_student_features(student, images, use_cls_token=True):
     return cls_embedding, patch_embeddings
 
 
+class ProjectionHead(nn.Module):
+    """
+    Simple MLP head for SSL representation learning.
+    Operates on student CLS embeddings (dim = student_dim, e.g., 384).
+    
+    Note: Does NOT L2-normalize outputs - Barlow Twins loss does its own normalization.
+    """
+    def __init__(self, in_dim: int, hidden_dim: int = 1024, out_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+    
+    def forward(self, x):
+        # x: [B, in_dim]
+        z = self.net(x)
+        # Don't normalize - Barlow Twins will normalize by mean/std per feature dimension
+        return z
+
+
+def off_diagonal(x: torch.Tensor) -> torch.Tensor:
+    """
+    Extract off-diagonal elements from a square matrix.
+    
+    Args:
+        x: [d, d] square matrix
+    
+    Returns:
+        Flattened off-diagonal elements
+    """
+    n, m = x.shape
+    assert n == m
+    # Flatten, remove diagonal, reshape
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+def barlow_twins_loss(z1: torch.Tensor, z2: torch.Tensor, lambd: float = 5e-3) -> torch.Tensor:
+    """
+    Barlow Twins loss for self-supervised learning.
+    
+    Args:
+        z1, z2: [B, d], raw projection outputs (NOT pre-normalized)
+        lambd: Weight for off-diagonal term (default: 5e-3)
+    
+    Returns:
+        Barlow Twins loss
+    
+    Note:
+        This function normalizes inputs by mean/std per feature dimension internally.
+        The ProjectionHead should NOT L2-normalize its outputs.
+    """
+    assert z1.shape == z2.shape
+    B, D = z1.shape
+    
+    # Normalize per feature dimension: zero mean and unit variance
+    # This is the standard Barlow Twins normalization
+    z1_norm = (z1 - z1.mean(dim=0, keepdim=True)) / (z1.std(dim=0, keepdim=True) + 1e-8)
+    z2_norm = (z2 - z2.mean(dim=0, keepdim=True)) / (z2.std(dim=0, keepdim=True) + 1e-8)
+    
+    # Cross-correlation matrix: [D, D]
+    # Each element c_ij = mean over batch of (z1_norm[:, i] * z2_norm[:, j])
+    c = (z1_norm.T @ z2_norm) / B
+    
+    # On-diagonal should be 1, off-diagonal should be 0
+    on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+    off_diag = off_diagonal(c).pow_(2).sum()
+    
+    loss = on_diag + lambd * off_diag
+    
+    return loss
+
+
 class DistillationLoss(nn.Module):
     """
     Knowledge distillation loss with learnable projections for dimension mismatch.
@@ -567,7 +641,8 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 use_cls_token=True, use_multi_crop=False,
                 max_steps_per_epoch=None, cache_teacher_features=False,
                 teacher_feature_dir=None, save_every=0, global_step=0,
-                checkpoint_dir=None, distillation_loss_module=None):
+                checkpoint_dir=None, distillation_loss_module=None,
+                student_projection_head=None, ssl_config=None):
     """
     Train one epoch with optimizations
     
@@ -596,7 +671,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
     """
     student.train()
     total_loss = 0
-    total_metrics = {'cls': 0, 'patch': 0}
+    total_metrics = {'cls': 0, 'patch': 0, 'ssl': 0}
     
     # Determine max steps
     total_batches = len(dataloader)
@@ -629,17 +704,55 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         
         batch_start = time.time()
         
-        # Handle multi-crop or single image
-        if use_multi_crop and isinstance(batch, list):
-            images = batch[0].to(device)  # Use first global crop
-        else:
+        # Handle batch format: either (view1, view2) for SSL or single image
+        # When SSL is enabled, DataLoader collates tuples into (batch_view1, batch_view2)
+        # Check for tuple first (SSL mode returns tuple of two batched views)
+        if isinstance(batch, tuple) and len(batch) == 2:
+            # Two views for SSL (Barlow Twins) - batch is (batch_view1, batch_view2)
+            images_view1 = batch[0].to(device)
+            images_view2 = batch[1].to(device)
+            images = images_view1  # Use view1 for KD (can also use view2, doesn't matter)
+            
+            # Convert to channels_last if supported
+            try:
+                images_view1 = images_view1.to(memory_format=torch.channels_last)
+                images_view2 = images_view2.to(memory_format=torch.channels_last)
+                images = images.to(memory_format=torch.channels_last)
+            except:
+                pass
+        elif isinstance(batch, list):
+            # Multi-crop mode or list of crops
+            if use_multi_crop:
+                images = batch[0].to(device)  # Use first global crop
+            else:
+                # List but not multi-crop - might be a single-element list or unexpected format
+                # Try to handle it gracefully
+                if len(batch) > 0:
+                    images = batch[0].to(device) if isinstance(batch[0], torch.Tensor) else torch.stack(batch).to(device)
+                else:
+                    raise ValueError(f"Empty batch list encountered")
+            images_view1 = images  # For compatibility
+            images_view2 = images  # Fallback (won't be used for SSL)
+            
+            # Convert to channels_last if supported
+            try:
+                images = images.to(memory_format=torch.channels_last)
+            except:
+                pass
+        elif isinstance(batch, torch.Tensor):
+            # Single image tensor (normal case when SSL is disabled)
             images = batch.to(device)
-        
-        # Convert to channels_last if supported
-        try:
-            images = images.to(memory_format=torch.channels_last)
-        except:
-            pass
+            images_view1 = images  # For compatibility
+            images_view2 = images  # Fallback (won't be used for SSL)
+            
+            # Convert to channels_last if supported
+            try:
+                images = images.to(memory_format=torch.channels_last)
+            except:
+                pass
+        else:
+            # Unexpected batch format
+            raise TypeError(f"Unexpected batch type: {type(batch)}. Expected tuple (for SSL), list (for multi-crop), or Tensor (for single view).")
         
         optimizer.zero_grad()
         
@@ -660,10 +773,18 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         cache_dir=teacher_feature_dir, cache_key=cache_key
                     )
                     
-                    # Student forward
+                    # Student forward on view1 (for KD)
                     student_cls, student_patches = extract_student_features(
                         student, images, use_cls_token=use_cls_token
                     )
+                    
+                    # Student forward on view2 (for SSL) - only if SSL is enabled
+                    if ssl_config and ssl_config.get('enabled', False) and student_projection_head is not None:
+                        student_cls_view2, _ = extract_student_features(
+                            student, images_view2, use_cls_token=use_cls_token
+                        )
+                    else:
+                        student_cls_view2 = None
                     
                     # Sanity debug: log statistics for initial batches
                     # This helps verify teacher targets are diverse and student is learning
@@ -692,12 +813,36 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                                 print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
                     
                     # Compute distillation loss
-                    loss, metrics = compute_distillation_loss(
+                    loss_kd, metrics = compute_distillation_loss(
                         student_cls, student_patches,
                         teacher_cls, teacher_patches,
                         loss_weights=loss_weights,
                         distillation_loss_module=distillation_loss_module
                     )
+                    
+                    # Compute SSL loss (Barlow Twins) if enabled
+                    loss_ssl = None
+                    if ssl_config and ssl_config.get('enabled', False) and student_projection_head is not None and student_cls_view2 is not None:
+                        # Project both views through projection head
+                        z1 = student_projection_head(student_cls)  # [B, proj_dim]
+                        z2 = student_projection_head(student_cls_view2)  # [B, proj_dim]
+                        
+                        # Barlow Twins loss
+                        barlow_lambd = ssl_config.get('barlow_lambd', 5e-3)
+                        loss_ssl = barlow_twins_loss(z1, z2, lambd=barlow_lambd)
+                        
+                        # Combine losses
+                        ssl_weight = ssl_config.get('weight', 0.5)
+                        loss = loss_kd + ssl_weight * loss_ssl
+                    else:
+                        loss = loss_kd
+                        loss_ssl = torch.tensor(0.0, device=device)
+                    
+                    # Update metrics
+                    if loss_ssl is not None:
+                        metrics['ssl'] = loss_ssl.item()
+                    else:
+                        metrics['ssl'] = 0.0
             else:
                 with autocast():
                     cache_key = None
@@ -709,9 +854,18 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                         cache_dir=teacher_feature_dir, cache_key=cache_key
                     )
                     
+                    # Student forward on view1 (for KD)
                     student_cls, student_patches = extract_student_features(
                         student, images, use_cls_token=use_cls_token
                     )
+                    
+                    # Student forward on view2 (for SSL) - only if SSL is enabled
+                    if ssl_config and ssl_config.get('enabled', False) and student_projection_head is not None:
+                        student_cls_view2, _ = extract_student_features(
+                            student, images_view2, use_cls_token=use_cls_token
+                        )
+                    else:
+                        student_cls_view2 = None
                     
                     # Sanity debug: log statistics for initial batches
                     # This helps verify teacher targets are diverse and student is learning
@@ -739,12 +893,37 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                             if teacher_pairwise_sim > 0.9:
                                 print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
                     
-                    loss, metrics = compute_distillation_loss(
+                    # Compute distillation loss
+                    loss_kd, metrics = compute_distillation_loss(
                         student_cls, student_patches,
                         teacher_cls, teacher_patches,
                         loss_weights=loss_weights,
                         distillation_loss_module=distillation_loss_module
                     )
+                    
+                    # Compute SSL loss (Barlow Twins) if enabled
+                    loss_ssl = None
+                    if ssl_config and ssl_config.get('enabled', False) and student_projection_head is not None and student_cls_view2 is not None:
+                        # Project both views through projection head
+                        z1 = student_projection_head(student_cls)  # [B, proj_dim]
+                        z2 = student_projection_head(student_cls_view2)  # [B, proj_dim]
+                        
+                        # Barlow Twins loss
+                        barlow_lambd = ssl_config.get('barlow_lambd', 5e-3)
+                        loss_ssl = barlow_twins_loss(z1, z2, lambd=barlow_lambd)
+                        
+                        # Combine losses
+                        ssl_weight = ssl_config.get('weight', 0.5)
+                        loss = loss_kd + ssl_weight * loss_ssl
+                    else:
+                        loss = loss_kd
+                        loss_ssl = torch.tensor(0.0, device=device)
+                    
+                    # Update metrics
+                    if loss_ssl is not None:
+                        metrics['ssl'] = loss_ssl.item()
+                    else:
+                        metrics['ssl'] = 0.0
         else:
             # CPU: no autocast
             cache_key = None
@@ -756,9 +935,18 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                 cache_dir=teacher_feature_dir, cache_key=cache_key
             )
             
+            # Student forward on view1 (for KD)
             student_cls, student_patches = extract_student_features(
                 student, images, use_cls_token=use_cls_token
             )
+            
+            # Student forward on view2 (for SSL) - only if SSL is enabled
+            if ssl_config and ssl_config.get('enabled', False) and student_projection_head is not None:
+                student_cls_view2, _ = extract_student_features(
+                    student, images_view2, use_cls_token=use_cls_token
+                )
+            else:
+                student_cls_view2 = None
             
             # Sanity debug: log statistics for initial batches
             # This helps verify teacher targets are diverse and student is learning
@@ -786,12 +974,37 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
                     if teacher_pairwise_sim > 0.9:
                         print(f"    ⚠️  WARNING: Teacher targets are collapsing!")
             
-            loss, metrics = compute_distillation_loss(
+            # Compute distillation loss
+            loss_kd, metrics = compute_distillation_loss(
                 student_cls, student_patches,
                 teacher_cls, teacher_patches,
                 loss_weights=loss_weights,
                 distillation_loss_module=distillation_loss_module
             )
+            
+            # Compute SSL loss (Barlow Twins) if enabled
+            loss_ssl = None
+            if ssl_config and ssl_config.get('enabled', False) and student_projection_head is not None and student_cls_view2 is not None:
+                # Project both views through projection head
+                z1 = student_projection_head(student_cls)  # [B, proj_dim]
+                z2 = student_projection_head(student_cls_view2)  # [B, proj_dim]
+                
+                # Barlow Twins loss
+                barlow_lambd = ssl_config.get('barlow_lambd', 5e-3)
+                loss_ssl = barlow_twins_loss(z1, z2, lambd=barlow_lambd)
+                
+                # Combine losses
+                ssl_weight = ssl_config.get('weight', 0.5)
+                loss = loss_kd + ssl_weight * loss_ssl
+            else:
+                loss = loss_kd
+                loss_ssl = torch.tensor(0.0, device=device)
+            
+            # Update metrics
+            if loss_ssl is not None:
+                metrics['ssl'] = loss_ssl.item()
+            else:
+                metrics['ssl'] = 0.0
         
         gpu_time = time.time() - gpu_start
         
@@ -802,6 +1015,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         total_loss += loss.item()
         total_metrics['cls'] += metrics['cls']
         total_metrics['patch'] += metrics['patch']
+        total_metrics['ssl'] += metrics.get('ssl', 0.0)
         steps_completed += 1
         global_step += 1
         
@@ -821,7 +1035,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
         
         # Update progress bar with detailed timing
         current_lr = optimizer.param_groups[0]['lr']
-        progress_bar.set_postfix({
+        postfix_dict = {
             'loss': f'{loss.item():.8f}',
             'cls': f'{metrics["cls"]:.8f}',
             'patch': f'{metrics["patch"]:.8f}',
@@ -830,7 +1044,10 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler,
             'data': f'{avg_data_time:.2f}s',
             'batch': f'{avg_batch_time:.2f}s',
             'step': f'{steps_completed}/{max_steps}'
-        })
+        }
+        if ssl_config and ssl_config.get('enabled', False) and metrics.get('ssl', 0.0) > 0:
+            postfix_dict['ssl'] = f'{metrics["ssl"]:.8f}'
+        progress_bar.set_postfix(postfix_dict)
         
         # Step-based checkpointing
         if save_every > 0 and global_step % save_every == 0 and checkpoint_dir:
@@ -868,7 +1085,7 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
                       compile_student=True, use_fused_adamw=True,
                       use_cls_token=True, use_multi_crop=False, 
                       max_steps_per_epoch=None, cache_teacher_features=False,
-                      teacher_feature_dir=None, save_every=0):
+                      teacher_feature_dir=None, save_every=0, ssl_config=None):
     """
     Main training function with all optimizations
     """
@@ -913,7 +1130,22 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         param.requires_grad = False
         print(f"  ✓ Frozen projection layer: {name}")
     
-    # Build optimizer: ONLY student parameters (projection layers are frozen)
+    # Create SSL projection head if SSL is enabled
+    student_projection_head = None
+    if ssl_config and ssl_config.get('enabled', False):
+        student_dim = 384  # ViT-S embedding dimension
+        proj_hidden_dim = ssl_config.get('proj_hidden_dim', 1024)
+        proj_out_dim = ssl_config.get('proj_out_dim', 256)
+        student_projection_head = ProjectionHead(
+            in_dim=student_dim,
+            hidden_dim=proj_hidden_dim,
+            out_dim=proj_out_dim
+        ).to(device)
+        print(f"✓ Created SSL projection head: {student_dim} → {proj_hidden_dim} → {proj_out_dim}")
+    else:
+        print("✓ SSL disabled (no projection head)")
+    
+    # Build optimizer: student parameters + projection head (if SSL enabled)
     # Group parameters: weight decay for non-bias/norm, no weight decay for bias/norm
     params_with_wd = []
     params_without_wd = []
@@ -922,6 +1154,15 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             params_without_wd.append(param)
         else:
             params_with_wd.append(param)
+    
+    # Add projection head parameters if SSL is enabled
+    if student_projection_head is not None:
+        for name, param in student_projection_head.named_parameters():
+            if any(nd in name for nd in ["bias", "norm", "ln"]):
+                params_without_wd.append(param)
+            else:
+                params_with_wd.append(param)
+    
     # DO NOT add distillation_loss_module parameters (they're frozen)
     
     param_groups = [
@@ -958,6 +1199,9 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
         if 'distillation_loss' in checkpoint:
             distillation_loss_module.load_state_dict(checkpoint['distillation_loss'])
             print("✓ Loaded distillation loss module state")
+        if student_projection_head is not None and 'student_projection_head' in checkpoint:
+            student_projection_head.load_state_dict(checkpoint['student_projection_head'])
+            print("✓ Loaded SSL projection head state")
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         scaler.load_state_dict(checkpoint['scaler'])
@@ -988,7 +1232,8 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
             teacher_feature_dir=teacher_feature_dir,
             save_every=save_every, global_step=global_step,
             checkpoint_dir=checkpoint_dir,
-            distillation_loss_module=distillation_loss_module
+            distillation_loss_module=distillation_loss_module,
+            student_projection_head=student_projection_head, ssl_config=ssl_config
         )
         
         print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.8f} "
@@ -1007,6 +1252,8 @@ def train_distillation(teacher, student, train_loader, num_epochs, device,
                 'epoch': epoch,
                 'global_step': global_step,
             }
+            if student_projection_head is not None:
+                checkpoint['student_projection_head'] = student_projection_head.state_dict()
             torch.save(checkpoint, f"{checkpoint_dir}/checkpoint_latest.pth")
             torch.save(checkpoint, f"{checkpoint_dir}/checkpoint_epoch_{epoch+1}.pth")
             print(f"  ✓ Saved checkpoint: checkpoint_epoch_{epoch+1}.pth")
@@ -1219,6 +1466,9 @@ def main():
     else:
         print("✓ Teacher feature caching disabled")
     
+    # SSL configuration
+    ssl_config = train_cfg.get('ssl', None)
+    
     train_distillation(
         teacher=teacher,
         student=student,
@@ -1238,7 +1488,8 @@ def main():
         max_steps_per_epoch=max_steps_per_epoch,
         cache_teacher_features=cache_teacher_features,
         teacher_feature_dir=teacher_feature_dir,
-        save_every=save_every
+        save_every=save_every,
+        ssl_config=ssl_config
     )
     
     print("✓ Training completed!")

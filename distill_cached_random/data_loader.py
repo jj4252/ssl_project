@@ -119,16 +119,18 @@ class CachedTensorDataset(Dataset):
     Each shard contains unnormalized tensors [N, 3, H, W] in range [0, 1].
     The transform should normalize and apply augmentations.
     """
-    def __init__(self, cache_dir: str, transform=None, max_shards: int = None, max_samples: int = None):
+    def __init__(self, cache_dir: str, transform=None, max_shards: int = None, max_samples: int = None, return_two_views: bool = False):
         """
         Args:
             cache_dir: Directory containing cached shard files and index file(s)
             transform: Transform to apply to each image tensor (should normalize + augment)
             max_shards: Optional limit on number of shard files to use (for testing)
             max_samples: Optional limit on total number of samples to use (for testing)
+            return_two_views: If True, return two augmented views for SSL (Barlow Twins)
         """
         self.cache_dir = Path(cache_dir)
         self.transform = transform
+        self.return_two_views = return_two_views
         
         # Try to load sharded index files first (new format), fallback to legacy index.json
         shard_index_files = sorted(self.cache_dir.glob("index_shard_*.json"))
@@ -388,7 +390,19 @@ class CachedTensorDataset(Dataset):
         
         # Apply transform (should normalize + apply augmentations)
         if self.transform is not None:
-            img = self.transform(img)
+            if self.return_two_views:
+                # Check if transform already returns two views (e.g., MoCoTransform)
+                result = self.transform(img)
+                if isinstance(result, tuple) and len(result) == 2:
+                    # Transform already returns (view1, view2)
+                    return result
+                else:
+                    # Transform returns single view, apply twice for two views
+                    view1 = self.transform(img)
+                    view2 = self.transform(img)  # Apply transform again (stochastic)
+                    return view1, view2
+            else:
+                img = self.transform(img)
         
         return img
     
@@ -523,7 +537,19 @@ class RandomShardSubsetCachedDataset(Dataset):
         
         # Apply transform (should normalize + apply augmentations)
         if self.base_dataset.transform is not None:
-            img = self.base_dataset.transform(img)
+            if self.base_dataset.return_two_views:
+                # Check if transform already returns two views (e.g., MoCoTransform)
+                result = self.base_dataset.transform(img)
+                if isinstance(result, tuple) and len(result) == 2:
+                    # Transform already returns (view1, view2)
+                    return result
+                else:
+                    # Transform returns single view, apply twice for two views
+                    view1 = self.base_dataset.transform(img)
+                    view2 = self.base_dataset.transform(img)  # Apply transform again (stochastic)
+                    return view1, view2
+            else:
+                img = self.base_dataset.transform(img)
         
         return img
     
@@ -630,12 +656,18 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         max_shards = data_config.get('max_shards', None)
         max_samples = data_config.get('max_samples', None)
         
+        # Check if SSL is enabled (for Barlow Twins, need two views)
+        ssl_config = train_config.get('ssl', {})
+        use_ssl = ssl_config.get('enabled', False)
+        return_two_views = use_ssl  # Return two views if SSL is enabled
+        
         # Build base cached dataset (full dataset)
         base_dataset = CachedTensorDataset(
             cache_dir=cache_root, 
             transform=transform,
             max_shards=max_shards,
-            max_samples=max_samples
+            max_samples=max_samples,
+            return_two_views=return_two_views
         )
         
         # Check if random shard sampling is enabled (preferred for performance)

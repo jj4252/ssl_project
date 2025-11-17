@@ -455,12 +455,6 @@ def main():
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
     
-    # Extract test features once (same for all checkpoints)
-    print(f"\n🔍 Extracting test features...")
-    student.eval()
-    test_features, test_labels = extract_features(student, test_loader, device, use_cls_token=use_cls_token)
-    print(f"  Test features shape: {test_features.shape}")
-    
     # Initialize results dictionary
     results = {}
     
@@ -646,6 +640,11 @@ def main():
         print(f"🔍 Extracting training features...")
         train_features, train_labels = extract_features(student, train_loader, device, use_cls_token=use_cls_token)
         print(f"  Train features shape: {train_features.shape}")
+        
+        # Extract test features using the loaded checkpoint model
+        print(f"🔍 Extracting test features...")
+        test_features, test_labels = extract_features(student, test_loader, device, use_cls_token=use_cls_token)
+        print(f"  Test features shape: {test_features.shape}")
         
         # Analyze feature quality
         feature_stats = analyze_features(train_features, name=f"Checkpoint {checkpoint_name} Features")

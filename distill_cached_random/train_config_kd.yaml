@@ -3,14 +3,16 @@
 
 # Training hyperparameters
 batch_size: 64
-num_epochs: 250
+num_epochs: 100
 learning_rate: 0.0005  # 5e-4
 weight_decay: 0.04
 warmup_epochs: 10
 min_lr: 1e-6
 
-# Step-capped training (major speedup)
-max_steps_per_epoch: 500  # Process only 500 batches per epoch
+# Step-capped training (optional - limits batches per epoch)
+# With samples_per_epoch=30000 and batch_size=64, we get ~468 batches per epoch
+# max_steps_per_epoch=500 provides capacity for 32K images, so it covers all 30K samples
+max_steps_per_epoch: 500  # Process up to 500 batches per epoch (covers all 30K samples)
 
 # Distillation loss weights
 distill_loss_weights:
@@ -38,4 +40,14 @@ pin_memory: true
 # Checkpointing
 checkpoint_dir: "/scratch/$USER/Nov_14_distill/checkpoints"
 save_every: 100  # Save checkpoint every N steps (0 = only at end of epoch)
+
+# SSL (Self-Supervised Learning) configuration
+# Adds Barlow Twins loss on top of KD to improve feature discriminativeness
+ssl:
+  enabled: false  # Set to true to enable SSL (Barlow Twins)
+  type: "barlow"  # SSL loss type (currently only "barlow" supported)
+  weight: 0.05    # Weight for SSL loss: L_total = L_kd + weight * L_ssl (0.05 recommended, 0.5 was too high)
+  barlow_lambd: 0.005  # Lambda for Barlow Twins off-diagonal term (default: 5e-3)
+  proj_hidden_dim: 1024  # Hidden dimension for projection head
+  proj_out_dim: 256      # Output dimension for projection head
 
