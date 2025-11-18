@@ -144,7 +144,7 @@ class MoCoTransform:
     Returns two views per image with strong augmentations.
     """
     def __init__(self, image_size=96):
-        # View 1: RandomResizedCrop + RandomHorizontalFlip + ColorJitter + RandomGrayscale + GaussianBlur
+        # View 1: RandomResizedCrop + RandomHorizontalFlip + ColorJitter + RandomGrayscale + GaussianBlur + Solarization
         self.transform1 = transforms.Compose([
             transforms.RandomResizedCrop(
                 image_size,
@@ -159,6 +159,9 @@ class MoCoTransform:
             transforms.RandomApply([
                 transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))
             ], p=0.5),
+            transforms.RandomApply([
+                transforms.RandomSolarize(threshold=128, p=1.0)
+            ], p=0.2),  # Add solarization to view 1 only
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                std=[0.229, 0.224, 0.225])

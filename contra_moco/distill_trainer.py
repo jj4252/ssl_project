@@ -343,9 +343,11 @@ class MoCoViT(nn.Module):
         backbone_name: str = "vit_small_patch16_224",
         image_size: int = 96,
         proj_dim: int = 256,
+        proj_hidden_dim: int = 0,  # 0 = use embed_dim (backward compatible)
         queue_size: int = 65536,
         momentum: float = 0.99,
         temperature: float = 0.2,
+        use_queue: bool = True,
     ):
         super().__init__()
         
@@ -369,16 +371,20 @@ class MoCoViT(nn.Module):
         embed_dim = self.encoder_q.num_features
         
         # Projection heads: MLP on top of CLS token
+        # Use proj_hidden_dim if provided (>0), otherwise use embed_dim (backward compatible)
+        if proj_hidden_dim <= 0:
+            proj_hidden_dim = embed_dim
+        
         self.proj_q = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, proj_hidden_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, proj_dim),
+            nn.Linear(proj_hidden_dim, proj_dim),
         )
         
         self.proj_k = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, proj_hidden_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, proj_dim),
+            nn.Linear(proj_hidden_dim, proj_dim),
         )
         
         # Initialize encoder_k params = encoder_q params, and stop gradients
@@ -401,7 +407,7 @@ class MoCoViT(nn.Module):
         self.temperature = temperature
         self.queue_size = queue_size
         self.proj_dim = proj_dim
-        self.use_queue = True  # Can disable queue for batch-only contrastive learning (debugging)
+        self.use_queue = use_queue  # Can disable queue for batch-only contrastive learning (debugging)
     
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
@@ -1391,7 +1397,8 @@ def train_moco(model, train_loader, num_epochs, device,
                lr=5e-4, weight_decay=0.05, warmup_epochs=10,
                checkpoint_dir=None, resume_from=None,
                compile_student=True, use_fused_adamw=True,
-               save_every=0):
+               save_every=0, max_grad_norm=1.0,
+               momentum_anneal=False, initial_momentum=0.99):
     """
     Train MoCo-v3 model with contrastive learning.
     
@@ -1408,6 +1415,9 @@ def train_moco(model, train_loader, num_epochs, device,
         compile_student: Whether to compile encoder_q
         use_fused_adamw: Whether to use fused AdamW
         save_every: Save checkpoint every N steps (0 = only at end of epoch)
+        max_grad_norm: Maximum gradient norm for clipping (0 = no clipping)
+        momentum_anneal: If True, anneal momentum from initial_momentum to 0.99 over training
+        initial_momentum: Initial momentum value (will anneal to 0.99 if momentum_anneal=True)
     """
     # Enable TF32 for faster training
     if device.type == 'cuda':
@@ -1511,6 +1521,15 @@ def train_moco(model, train_loader, num_epochs, device,
     
     # Training loop
     for epoch in range(start_epoch, num_epochs):
+        # Momentum annealing: linearly interpolate from initial_momentum to 0.99
+        if momentum_anneal:
+            # Anneal over the course of training (from epoch 0 to num_epochs-1)
+            progress = epoch / max(num_epochs - 1, 1)  # 0.0 to 1.0
+            current_momentum = initial_momentum + (0.99 - initial_momentum) * progress
+            model.momentum = current_momentum
+            if epoch % 10 == 0 or epoch == start_epoch:
+                print(f"  Momentum: {current_momentum:.4f} (annealing from {initial_momentum} to 0.99)")
+        
         model.train()
         # Set encoder_k to eval mode (it's always in eval mode, but be explicit)
         model.encoder_k.eval()
@@ -1576,6 +1595,13 @@ def train_moco(model, train_loader, num_epochs, device,
             
             # Backward pass
             scaler.scale(loss).backward()
+            
+            # Gradient clipping (if enabled)
+            if max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.encoder_q.parameters(), max_norm=max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.proj_q.parameters(), max_norm=max_grad_norm)
+            
             scaler.step(optimizer)
             scaler.update()
             
@@ -1995,15 +2021,21 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
     # Get MoCo config
     moco_cfg = train_cfg.get('moco', {})
     proj_dim = moco_cfg.get('proj_dim', 256)
+    proj_hidden_dim = moco_cfg.get('proj_hidden_dim', 0)  # 0 = use embed_dim
     queue_size = moco_cfg.get('queue_size', 65536)
     momentum = moco_cfg.get('momentum', 0.99)
+    momentum_anneal = moco_cfg.get('momentum_anneal', False)
     temperature = moco_cfg.get('temperature', 0.2)
+    use_queue = moco_cfg.get('use_queue', True)
     
     print(f"MoCo-v3 Configuration:")
     print(f"  Projection dimension: {proj_dim}")
+    if proj_hidden_dim > 0:
+        print(f"  Projection hidden dimension: {proj_hidden_dim}")
     print(f"  Queue size: {queue_size:,}")
-    print(f"  Momentum: {momentum}")
+    print(f"  Momentum: {momentum}" + (f" (will anneal to 0.99)" if momentum_anneal else ""))
     print(f"  Temperature: {temperature}")
+    print(f"  Use queue: {use_queue}" + (" (batch-only mode)" if not use_queue else ""))
     
     # Build model
     backbone_name = model_cfg.get('student_name', 'vit_small_patch16_224')
@@ -2017,9 +2049,11 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
         backbone_name=backbone_name,
         image_size=image_size,
         proj_dim=proj_dim,
+        proj_hidden_dim=proj_hidden_dim,
         queue_size=queue_size,
         momentum=momentum,
         temperature=temperature,
+        use_queue=use_queue,
     ).to(device)
     
     # Count parameters
@@ -2061,6 +2095,9 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
         compile_student=train_cfg.get('compile_student', True),
         use_fused_adamw=train_cfg.get('use_fused_adamw', True),
         save_every=save_every,
+        max_grad_norm=train_cfg.get('max_grad_norm', 1.0),
+        momentum_anneal=momentum_anneal,
+        initial_momentum=momentum,
     )
 
 
