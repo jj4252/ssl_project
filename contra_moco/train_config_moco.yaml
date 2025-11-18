@@ -17,9 +17,9 @@ moco:
   proj_dim: 256           # Projection head output dimension
   proj_hidden_dim: 1024   # Hidden dimension in projection head (384 → 1024 → 256, set to 0 to use embed_dim)
   queue_size: 65536       # Number of negative keys in queue (try 4096 for debugging if collapse persists)
-  momentum: 0.95          # EMA momentum for key encoder (lowered from 0.99 for faster updates, can anneal to 0.99)
+  momentum: 0.90          # EMA momentum for key encoder (reduced from 0.95 for faster updates to prevent collapse)
   momentum_anneal: true   # If true, anneal momentum from initial value to 0.99 over training
-  temperature: 0.4        # InfoNCE temperature (increased from 0.3 to reduce collapse risk, can try 0.5-0.7)
+  temperature: 0.7        # InfoNCE temperature (increased from 0.4 to 0.7 to prevent query feature collapse)
   use_queue: true         # If false, use batch-only contrastive learning (no queue, for debugging)
 
 # Data augmentation (MoCo-v3 style)
