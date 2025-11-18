@@ -1,0 +1,32 @@
+# Data loading configuration for ResNet-50
+# ResNet-50 requires 224x224 images (standard ImageNet size)
+
+# Dataset configuration
+# For CIFAR: set dataset_name to "cifar10" or "cifar100"
+# For HuggingFace: set dataset_name to "tsbpp/fall2025_deeplearning" and use cached tensors
+dataset_name: "tsbpp/fall2025_deeplearning"  # Options: "cifar10", "cifar100", or HuggingFace dataset name
+dataset_root: "./data"  # Root directory for CIFAR data (will download if not present)
+max_samples: null  # null = use full dataset
+
+# Image size (ResNet-50 standard)
+image_size: 224  # Standard ImageNet size for ResNet (224x224)
+
+# Cache configuration (2-stage pipeline for HuggingFace dataset)
+# Auto-detection: If cache exists, it will be used automatically
+use_cached_tensors: null  # null = auto-detect, true = force enable, false = force disable
+cache_root: "/scratch/jj4252/Nov_14_distill/cache_images"  # Root directory for cached tensors
+cache_image_size: 224  # Match ResNet image size (224x224)
+cache_dtype: "float32"  # Data type for cached tensors (float32 or float16)
+cache_shard_size: 2048  # Number of samples per shard file
+
+# Random shard-level sampling per epoch (FAST - better cache locality)
+# For each epoch, randomly pick N shards and use all images from those shards sequentially.
+shards_per_epoch: 25  # Number of random shard files to use per epoch (~50K images with 2048 per shard)
+random_subset_seed: 42  # Random seed for shard sampling (for reproducibility)
+
+# DataLoader settings (optimized for Slurm)
+num_workers: 2  # Reduced to prevent OOM
+persistent_workers: false  # Must be false
+prefetch_factor: 1  # Reduced to prevent OOM
+pin_memory: true
+

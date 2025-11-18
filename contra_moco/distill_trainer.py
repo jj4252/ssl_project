@@ -332,10 +332,11 @@ class ProjectionHead(nn.Module):
         return z
 
 
-class MoCoViT(nn.Module):
+class MoCoModel(nn.Module):
     """
-    MoCo-v3 style contrastive learning with Vision Transformer.
+    MoCo-v3 style contrastive learning with flexible backbone support.
     
+    Supports both Vision Transformers (ViT) and ResNet backbones.
     Uses momentum encoder and a queue of negative samples for contrastive learning.
     """
     def __init__(
@@ -348,29 +349,62 @@ class MoCoViT(nn.Module):
         momentum: float = 0.99,
         temperature: float = 0.2,
         use_queue: bool = True,
+        backbone_type: str = "auto",  # "auto", "vit", "resnet" - auto-detect from backbone_name
     ):
         super().__init__()
         
+        # Auto-detect backbone type if not specified
+        if backbone_type == "auto":
+            if "vit" in backbone_name.lower() or "deit" in backbone_name.lower():
+                backbone_type = "vit"
+            elif "resnet" in backbone_name.lower() or "res" in backbone_name.lower():
+                backbone_type = "resnet"
+            else:
+                # Default to ViT for timm models
+                backbone_type = "vit"
+        
+        self.backbone_type = backbone_type
+        
         # Query encoder (trainable)
-        self.encoder_q = timm.create_model(
-            backbone_name,
-            img_size=image_size,
-            num_classes=0,  # We use CLS features, no classifier
-            pretrained=False,  # Start from scratch
-        )
+        if backbone_type == "vit":
+            self.encoder_q = timm.create_model(
+                backbone_name,
+                img_size=image_size,
+                num_classes=0,  # We use CLS features, no classifier
+                pretrained=False,  # Start from scratch
+                global_pool="",  # Don't pool, return all tokens for ViT
+            )
+        else:  # ResNet
+            self.encoder_q = timm.create_model(
+                backbone_name,
+                img_size=image_size,
+                num_classes=0,  # We use global pooling features, no classifier
+                pretrained=False,  # Start from scratch
+                global_pool="avg",  # Global average pooling for ResNet
+            )
         
         # Key encoder (momentum encoder, same architecture)
-        self.encoder_k = timm.create_model(
-            backbone_name,
-            img_size=image_size,
-            num_classes=0,
-            pretrained=False,
-        )
+        if backbone_type == "vit":
+            self.encoder_k = timm.create_model(
+                backbone_name,
+                img_size=image_size,
+                num_classes=0,
+                pretrained=False,
+                global_pool="",  # Don't pool, return all tokens for ViT
+            )
+        else:  # ResNet
+            self.encoder_k = timm.create_model(
+                backbone_name,
+                img_size=image_size,
+                num_classes=0,
+                pretrained=False,
+                global_pool="avg",  # Global average pooling for ResNet
+            )
         
         # Get embedding dimension from encoder
         embed_dim = self.encoder_q.num_features
         
-        # Projection heads: MLP on top of CLS token
+        # Projection heads: MLP on top of features
         # Use proj_hidden_dim if provided (>0), otherwise use embed_dim (backward compatible)
         if proj_hidden_dim <= 0:
             proj_hidden_dim = embed_dim
@@ -466,16 +500,29 @@ class MoCoViT(nn.Module):
         ptr = (ptr + batch_size) % self.queue_size
         self.queue_ptr[0] = ptr
     
-    def _extract_cls_features(self, encoder, images):
-        """Extract CLS token features from ViT encoder"""
-        features = encoder.forward_features(images)
-        if isinstance(features, torch.Tensor):
-            # If features is a tensor, CLS is first token
-            cls_features = features[:, 0]  # [B, embed_dim]
+    def _extract_features(self, encoder, images):
+        """
+        Extract features from encoder (backbone-agnostic).
+        
+        For ViT: extracts CLS token features
+        For ResNet: extracts global average pooled features
+        """
+        if self.backbone_type == "vit":
+            # ViT: extract CLS token
+            features = encoder.forward_features(images)
+            if isinstance(features, torch.Tensor):
+                # If features is a tensor, CLS is first token
+                feat = features[:, 0]  # [B, embed_dim]
+            else:
+                # If features is a dict, extract CLS token
+                feat = features.get('x', features.get('tokens', None))[:, 0]
         else:
-            # If features is a dict, extract CLS token
-            cls_features = features.get('x', features.get('tokens', None))[:, 0]
-        return cls_features
+            # ResNet: forward_features already returns pooled features with global_pool="avg"
+            feat = encoder.forward_features(images)
+            # If it's still a tensor with spatial dimensions, do global pooling
+            if len(feat.shape) > 2:
+                feat = F.adaptive_avg_pool2d(feat, (1, 1)).flatten(1)
+        return feat
     
     def forward_moco(self, im_q: torch.Tensor, im_k: torch.Tensor) -> torch.Tensor:
         """
@@ -497,7 +544,7 @@ class MoCoViT(nn.Module):
         # -----------------
         # Query branch
         # -----------------
-        q_features = self._extract_cls_features(self.encoder_q, im_q)  # [B, embed_dim]
+        q_features = self._extract_features(self.encoder_q, im_q)  # [B, embed_dim]
         q = self.proj_q(q_features)  # [B, proj_dim]
         q = F.normalize(q, dim=-1)  # L2 normalize
         
@@ -509,7 +556,7 @@ class MoCoViT(nn.Module):
             self._momentum_update_key_encoder()
             
             # Forward through momentum encoder
-            k_features = self._extract_cls_features(self.encoder_k, im_k)  # [B, embed_dim]
+            k_features = self._extract_features(self.encoder_k, im_k)  # [B, embed_dim]
             k = self.proj_k(k_features)  # [B, proj_dim]
             k = F.normalize(k, dim=-1)  # L2 normalize
         
@@ -1403,7 +1450,7 @@ def train_moco(model, train_loader, num_epochs, device,
     Train MoCo-v3 model with contrastive learning.
     
     Args:
-        model: MoCoViT model
+        model: MoCoModel (supports both ViT and ResNet backbones)
         train_loader: DataLoader returning (view1, view2) tuples
         num_epochs: Number of training epochs
         device: Device to train on
@@ -1613,11 +1660,11 @@ def train_moco(model, train_loader, num_epochs, device,
             if (batch_idx % 50 == 0) or (epoch < 5 and batch_idx == 0):
                 with torch.no_grad():
                     # Extract features for diagnostics (recompute to avoid modifying forward_moco)
-                    q_features = model._extract_cls_features(model.encoder_q, im_q)
+                    q_features = model._extract_features(model.encoder_q, im_q)
                     q = model.proj_q(q_features)
                     q_norm = F.normalize(q, dim=-1)
                     
-                    k_features = model._extract_cls_features(model.encoder_k, im_k)
+                    k_features = model._extract_features(model.encoder_k, im_k)
                     k = model.proj_k(k_features)
                     k_norm = F.normalize(k, dim=-1)
                     
@@ -2038,14 +2085,18 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
     print(f"  Use queue: {use_queue}" + (" (batch-only mode)" if not use_queue else ""))
     
     # Build model
-    backbone_name = model_cfg.get('student_name', 'vit_small_patch16_224')
-    image_size = data_cfg.get('image_size', 96)
+    # Support both 'student_name' (legacy) and 'backbone_name' (new)
+    backbone_name = model_cfg.get('backbone_name', model_cfg.get('student_name', 'vit_small_patch16_224'))
+    image_size = model_cfg.get('image_size', data_cfg.get('image_size', 96))
     
     print(f"\nBuilding MoCo-v3 model...")
     print(f"  Backbone: {backbone_name}")
     print(f"  Image size: {image_size}x{image_size}")
     
-    model = MoCoViT(
+    # Get backbone type from model config (for explicit control)
+    backbone_type = model_cfg.get('backbone_type', 'auto')
+    
+    model = MoCoModel(
         backbone_name=backbone_name,
         image_size=image_size,
         proj_dim=proj_dim,
@@ -2054,6 +2105,7 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
         momentum=momentum,
         temperature=temperature,
         use_queue=use_queue,
+        backbone_type=backbone_type,
     ).to(device)
     
     # Count parameters

@@ -1,0 +1,10 @@
+# MoCo-v3 Model Config for ResNet-50
+
+# Backbone configuration
+backbone_name: "resnet50"  # ResNet-50 from timm
+backbone_type: "resnet"  # Explicitly set to "resnet" (or "auto" for auto-detection)
+image_size: 224  # Standard ImageNet size for ResNet (can be adjusted)
+
+# Model architecture
+# ResNet uses global average pooling (no CLS token)
+

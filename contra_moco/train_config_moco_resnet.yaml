@@ -1,0 +1,48 @@
+# MoCo-v3 Training Config for ResNet-50
+# Standard MoCo-v3 hyperparameters for ResNet backbones
+
+# Training mode
+training_mode: "moco_v3"
+
+# Training hyperparameters
+batch_size: 256
+num_epochs: 200
+learning_rate: 0.001  # 1e-3 for AdamW (standard for ResNet MoCo)
+# Alternative: use SGD with lr=0.03 (uncomment optimizer section below)
+weight_decay: 0.0001  # 1e-4 (standard for ResNet)
+warmup_epochs: 10
+min_lr: 1e-6
+
+# MoCo-v3 specific settings (standard ResNet config)
+moco:
+  proj_dim: 128           # Standard projection dimension for ResNet MoCo
+  proj_hidden_dim: 2048   # Hidden dimension in projection head (2048 → 2048 → 128)
+  queue_size: 65536       # Number of negative keys in queue
+  momentum: 0.999         # Standard momentum for ResNet (higher than ViT)
+  momentum_anneal: false  # Keep momentum constant (standard for ResNet)
+  temperature: 0.2        # Standard temperature for ResNet MoCo (0.2-0.5 range)
+  use_queue: true         # Enable queue (standard for ResNet)
+
+# Data augmentation (MoCo-v3 style - strong augmentations)
+# Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur, Solarization
+use_moco_aug: true  # Use MoCo-v3 style augmentations
+
+# Optimization settings
+compile_student: true   # Compile encoder_q (never compile encoder_k)
+use_fused_adamw: true   # Use fused AdamW optimizer
+# Alternative: use SGD (uncomment below and set learning_rate to 0.03)
+# optimizer: "sgd"
+# learning_rate: 0.03
+# momentum: 0.9  # SGD momentum (different from MoCo momentum)
+max_grad_norm: 1.0      # Gradient clipping (0 = disabled)
+
+# DataLoader settings
+num_workers: 4
+persistent_workers: false
+prefetch_factor: 2
+pin_memory: true
+
+# Checkpointing
+checkpoint_dir: "/scratch/$USER/Nov_14_distill/checkpoints_moco_resnet"
+save_every: 0  # Save checkpoint only at end of epoch (0 = disable step-based saving)
+

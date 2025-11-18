@@ -1,0 +1,10 @@
+# MoCo-v3 Model Config for Vision Transformer (ViT)
+
+# Backbone configuration
+backbone_name: "vit_small_patch16_224"  # ViT-S/16 from timm
+backbone_type: "vit"  # Explicitly set to "vit" (or "auto" for auto-detection)
+image_size: 96  # Image size for training (CIFAR-10 upscaled or custom dataset)
+
+# Model architecture
+use_cls_token: true  # Use CLS token for ViT (always true for ViT)
+

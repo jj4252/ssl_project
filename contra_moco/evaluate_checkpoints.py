@@ -92,8 +92,9 @@ def load_checkpoint(checkpoint_path, device, mode='kd'):
 
 def build_student_model(model_config, device):
     """Build student model architecture"""
-    model_name = model_config['student_name']
-    img_size = model_config['student_img_size']
+    # Support both 'student_name' (legacy) and 'backbone_name' (new)
+    model_name = model_config.get('backbone_name', model_config.get('student_name', 'vit_small_patch16_224'))
+    img_size = model_config.get('image_size', model_config.get('student_img_size', 224))
     
     print(f"Building student model: {model_name} with img_size={img_size}")
     
@@ -242,11 +243,24 @@ def extract_features(model, dataloader, device, use_cls_token=True):
                 # DINOv2 features are already normalized, but normalize again to be safe
                 feat = F.normalize(feat, dim=-1, p=2)
             else:
-                # Tensor format (timm models): [B, N+1, D] (CLS + patches)
-                if use_cls_token:
-                    feat = outputs[:, 0]  # CLS token [B, D]
+                # Tensor format (timm models)
+                # For ViT: [B, N+1, D] (CLS + patches)
+                # For ResNet: [B, D] (already pooled)
+                if len(outputs.shape) == 3:
+                    # ViT format: [B, N+1, D]
+                    if use_cls_token:
+                        feat = outputs[:, 0]  # CLS token [B, D]
+                    else:
+                        feat = outputs[:, 1:].mean(dim=1)  # Mean-pool patches [B, D]
+                elif len(outputs.shape) == 2:
+                    # ResNet format: [B, D] (already pooled)
+                    feat = outputs
                 else:
-                    feat = outputs[:, 1:].mean(dim=1)  # Mean-pool patches [B, D]
+                    # Handle spatial dimensions (ResNet before pooling)
+                    if len(outputs.shape) == 4:
+                        feat = F.adaptive_avg_pool2d(outputs, (1, 1)).flatten(1)
+                    else:
+                        raise ValueError(f"Unexpected feature shape: {outputs.shape}")
                 
                 # Normalize features
                 feat = F.normalize(feat, dim=-1, p=2)
