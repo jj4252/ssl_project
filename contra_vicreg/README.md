@@ -99,6 +99,8 @@ python distill_trainer.py \
     --device cuda
 ```
 
+**Note:** Make sure you're in the `contra_vicreg` directory or provide full paths to the config files.
+
 ### Evaluation
 
 ```bash
@@ -109,6 +111,8 @@ python evaluate_checkpoints.py \
     --mode vicreg \
     --epochs 1 50 100 150 200
 ```
+
+**Important:** The model config file is named `model_config_vicreg.yaml` (not `model_config_vit_vicreg.yaml`).
 
 ## Diagnostics
 
