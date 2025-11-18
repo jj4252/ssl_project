@@ -309,17 +309,31 @@ def train_vicreg(
     
     # Resume from checkpoint if provided
     if resume_from:
-        checkpoint = torch.load(resume_from, map_location=device)
-        model.load_state_dict(checkpoint['model'])
-        if 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'scheduler' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        if 'scaler' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler'])
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        global_step = checkpoint.get('global_step', 0)
-        print(f"✓ Resumed from epoch {start_epoch}, step {global_step}")
+        try:
+            # Try to load checkpoint with error handling for corrupted files
+            checkpoint = torch.load(resume_from, map_location=device)
+            
+            # Validate checkpoint has required keys
+            if 'model' not in checkpoint:
+                raise ValueError(f"Checkpoint missing 'model' key: {resume_from}")
+            
+            model.load_state_dict(checkpoint['model'])
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            global_step = checkpoint.get('global_step', 0)
+            print(f"✓ Resumed from epoch {start_epoch}, step {global_step}")
+        except (RuntimeError, ValueError, EOFError, KeyError) as e:
+            print(f"⚠️  ERROR: Failed to load checkpoint {resume_from}: {e}")
+            print(f"  This checkpoint may be corrupted or incomplete.")
+            print(f"  Starting training from scratch (epoch 0)...")
+            resume_from = None  # Clear resume_from to start fresh
+            start_epoch = 0
+            global_step = 0
     
     # Training loop
     for epoch in range(start_epoch, num_epochs):
@@ -563,6 +577,56 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def find_valid_checkpoint(checkpoint_dir):
+    """
+    Find the latest valid checkpoint in the checkpoint directory.
+    Tries checkpoint_latest.pth first, then falls back to epoch-based checkpoints.
+    
+    Returns:
+        Path to valid checkpoint, or None if none found
+    """
+    if not checkpoint_dir or not os.path.exists(checkpoint_dir):
+        return None
+    
+    # Try latest checkpoint first
+    latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
+    if os.path.exists(latest_path):
+        try:
+            test_checkpoint = torch.load(latest_path, map_location='cpu')
+            if 'model' in test_checkpoint:
+                return latest_path
+        except (RuntimeError, ValueError, EOFError, KeyError):
+            pass  # Latest checkpoint is corrupted, try epoch-based
+    
+    # Fall back to epoch-based checkpoints (find highest epoch number)
+    import glob
+    epoch_checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*.pth'))
+    if not epoch_checkpoints:
+        return None
+    
+    # Sort by epoch number (extract from filename)
+    def get_epoch_num(path):
+        try:
+            basename = os.path.basename(path)
+            epoch_str = basename.replace('checkpoint_epoch_', '').replace('.pth', '')
+            return int(epoch_str)
+        except ValueError:
+            return -1
+    
+    epoch_checkpoints.sort(key=get_epoch_num, reverse=True)
+    
+    # Try each checkpoint from newest to oldest
+    for checkpoint_path in epoch_checkpoints:
+        try:
+            test_checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            if 'model' in test_checkpoint:
+                return checkpoint_path
+        except (RuntimeError, ValueError, EOFError, KeyError):
+            continue  # This checkpoint is corrupted, try next
+    
+    return None  # No valid checkpoint found
+
+
 def run_vicreg_training(data_cfg, train_cfg, model_cfg, device, args):
     """Run VICReg self-supervised learning training"""
     print("\n" + "="*60)
@@ -619,12 +683,13 @@ def run_vicreg_training(data_cfg, train_cfg, model_cfg, device, args):
     # Auto-detect latest checkpoint if resume_from not provided
     resume_from = args.resume_from
     if resume_from is None and not args.no_resume:
-        # Try to find latest checkpoint
-        if checkpoint_dir and os.path.exists(checkpoint_dir):
-            latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
-            if os.path.exists(latest_path):
-                resume_from = latest_path
-                print(f"✓ Auto-detected latest checkpoint: {resume_from}")
+        # Try to find valid checkpoint (handles corrupted checkpoints gracefully)
+        valid_checkpoint = find_valid_checkpoint(checkpoint_dir)
+        if valid_checkpoint:
+            resume_from = valid_checkpoint
+            print(f"✓ Auto-detected valid checkpoint: {resume_from}")
+        else:
+            print(f"  No valid checkpoint found, starting training from scratch...")
     
     # Training hyperparameters
     num_epochs = train_cfg.get('num_epochs', 200)
