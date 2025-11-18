@@ -1621,24 +1621,31 @@ def train_moco(model, train_loader, num_epochs, device,
                         logits_neg_check = q_norm @ model.queue  # [B, queue_size]
                         pos_mean = logits_pos_check.mean().item()
                         neg_mean = logits_neg_check.mean().item()
-                        pos_neg_ratio = pos_mean / (neg_mean + 1e-8)
                     else:
                         pos_mean = pos_sim
                         neg_mean = neg_sim
-                        pos_neg_ratio = pos_mean / (neg_mean + 1e-8)
+                    
+                    # FIXED: Compare directly using difference (ratio breaks when neg_mean < 0)
+                    # When neg_mean is negative, that's actually GOOD (negatives are far apart)
+                    pos_neg_diff = pos_mean - neg_mean  # Should be positive and large
+                    # Use absolute value for ratio to handle negative neg_mean correctly
+                    pos_neg_ratio = pos_mean / (abs(neg_mean) + 1e-8) if neg_mean != 0 else float('inf')
                     
                     print(f"\n🔍 MoCo Diagnostics (epoch {epoch+1}, batch {batch_idx}):")
                     print(f"  Positive similarity (q·k): {pos_sim:.4f} (should increase, target >0.7)")
-                    print(f"  Negative similarity (q·{'queue' if model.use_queue else 'batch'}): {neg_sim:.4f} (should stay low, target <0.1)")
-                    print(f"  Pos/Neg ratio: {pos_neg_ratio:.4f} (should be >1.0, ideally >2.0)")
+                    print(f"  Negative similarity (q·{'queue' if model.use_queue else 'batch'}): {neg_sim:.4f} (should stay low/negative, target <0.1)")
+                    print(f"  Pos - Neg difference: {pos_neg_diff:.4f} (should be >0.5, ideally >0.8)")
+                    print(f"  Pos/|Neg| ratio: {pos_neg_ratio:.4f} (should be >1.0, ideally >2.0)")
                     print(f"  Query diversity (q pairwise sim): {q_pairwise_sim:.4f} (should be 0.1-0.5)")
                     print(f"  Query per-dim variance: {q_var:.6f} (expected ~{expected_var:.6f})")
                     
-                    # Warnings
-                    if pos_neg_ratio < 1.0:
+                    # Warnings - FIXED: Check difference instead of ratio
+                    if pos_neg_diff < 0:
                         print(f"  ⚠️  CRITICAL: Positive < Negative! Model learning backwards - check labels/augmentations!")
+                    elif pos_neg_diff < 0.5:
+                        print(f"  ⚠️  WARNING: Pos-Neg difference is low - model may not be learning contrastive signal well")
                     elif pos_neg_ratio < 1.5:
-                        print(f"  ⚠️  WARNING: Pos/Neg ratio is low - model may not be learning contrastive signal well")
+                        print(f"  ⚠️  WARNING: Pos/|Neg| ratio is low - model may not be learning contrastive signal well")
                     
                     if q_pairwise_sim > 0.9:
                         print(f"  ⚠️  WARNING: Features are collapsing! (pairwise sim >0.9)")
