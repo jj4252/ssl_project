@@ -375,9 +375,9 @@ class MoCoModel(nn.Module):
                 global_pool="",  # Don't pool, return all tokens for ViT
             )
         else:  # ResNet
+            # ResNet models don't accept img_size parameter
             self.encoder_q = timm.create_model(
                 backbone_name,
-                img_size=image_size,
                 num_classes=0,  # We use global pooling features, no classifier
                 pretrained=False,  # Start from scratch
                 global_pool="avg",  # Global average pooling for ResNet
@@ -393,9 +393,9 @@ class MoCoModel(nn.Module):
                 global_pool="",  # Don't pool, return all tokens for ViT
             )
         else:  # ResNet
+            # ResNet models don't accept img_size parameter
             self.encoder_k = timm.create_model(
                 backbone_name,
-                img_size=image_size,
                 num_classes=0,
                 pretrained=False,
                 global_pool="avg",  # Global average pooling for ResNet
@@ -2095,6 +2095,13 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
     
     # Get backbone type from model config (for explicit control)
     backbone_type = model_cfg.get('backbone_type', 'auto')
+    
+    # Warn if ResNet is being used with non-standard image size
+    if backbone_type == "resnet" or ("resnet" in backbone_name.lower()):
+        if image_size != 224:
+            print(f"  ⚠️  WARNING: ResNet models are typically trained on 224x224 images.")
+            print(f"     Using {image_size}x{image_size} will work (ResNet is fully convolutional),")
+            print(f"     but performance may be suboptimal. Consider using image_size: 224.")
     
     model = MoCoModel(
         backbone_name=backbone_name,
