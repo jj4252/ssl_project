@@ -5,9 +5,9 @@
 training_mode: "vicreg"
 
 # Training hyperparameters
-batch_size: 128  # Can increase to 256 if memory allows
+batch_size: 256  # Increased from 128 for better variance/covariance estimates
 num_epochs: 200
-learning_rate: 0.001  # 1e-3
+learning_rate: 0.0005  # Reduced from 0.001 for stability
 weight_decay: 0.0001  # 1e-4
 warmup_epochs: 10
 min_lr: 1e-6
@@ -16,10 +16,10 @@ min_lr: 1e-6
 vicreg:
   proj_dim: 2048           # Projection head output dimension
   proj_hidden_dim: 2048    # Hidden dimension in projection head
-  lambda_invariance: 25.0  # Weight for invariance term
+  lambda_invariance: 20.0  # Weight for invariance term (reduced from 25.0 to prevent over-pulling)
   mu_variance: 25.0        # Weight for variance term
-  nu_covariance: 1.0       # Weight for covariance term
-  gamma: 1.0               # Target standard deviation for variance term
+  nu_covariance: 5.0       # Weight for covariance term (increased from 1.0 to prevent direction collapse)
+  gamma: 1.5               # Target standard deviation for variance term (increased from 1.0 to encourage more variance)
 
 # Data augmentation (VICReg style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur
