@@ -5,9 +5,9 @@
 training_mode: "vicreg"
 
 # Training hyperparameters
-batch_size: 256  # Increased from 128 for better variance/covariance estimates
+batch_size: 128  # Keep at 128 - VICReg's memory issue is from large proj_dim (2048) and covariance matrices [2048x2048], not just batch size
 num_epochs: 200
-learning_rate: 0.0005  # Reduced from 0.001 for stability
+learning_rate: 0.0003  # Further reduced from 0.0005 for stability (gradient norm is high: 6.08)
 weight_decay: 0.0001  # 1e-4
 warmup_epochs: 10
 min_lr: 1e-6
@@ -16,10 +16,10 @@ min_lr: 1e-6
 vicreg:
   proj_dim: 2048           # Projection head output dimension
   proj_hidden_dim: 2048    # Hidden dimension in projection head
-  lambda_invariance: 20.0  # Weight for invariance term (reduced from 25.0 to prevent over-pulling)
+  lambda_invariance: 10.0  # Weight for invariance term (aggressively reduced from 20.0 to prevent over-pulling)
   mu_variance: 25.0        # Weight for variance term
-  nu_covariance: 5.0       # Weight for covariance term (increased from 1.0 to prevent direction collapse)
-  gamma: 1.5               # Target standard deviation for variance term (increased from 1.0 to encourage more variance)
+  nu_covariance: 15.0      # Weight for covariance term (aggressively increased from 5.0 to prevent complete collapse)
+  gamma: 2.0               # Target standard deviation for variance term (increased from 1.5 to encourage more variance)
 
 # Data augmentation (VICReg style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur
@@ -28,12 +28,12 @@ use_vicreg_aug: true  # Use VICReg style augmentations
 # Optimization settings
 compile_model: true   # Compile model with torch.compile
 use_fused_adamw: true # Use fused AdamW optimizer
-max_grad_norm: 1.0    # Gradient clipping (0 = disabled)
+max_grad_norm: 0.5    # Gradient clipping (reduced from 1.0 - gradient norm was 6.08, needs stricter clipping)
 
-# DataLoader settings
-num_workers: 4
+# DataLoader settings (reduced to prevent OOM)
+num_workers: 2  # Reduced from 4 to match data_config and prevent OOM
 persistent_workers: false
-prefetch_factor: 2
+prefetch_factor: 1  # Reduced from 2 to prevent OOM
 pin_memory: true
 
 # Checkpointing
