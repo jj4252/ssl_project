@@ -1,0 +1,42 @@
+# VICReg Training Config
+# Self-supervised learning with ViT-S/16 backbone
+
+# Training mode
+training_mode: "vicreg"
+
+# Training hyperparameters
+batch_size: 128  # Can increase to 256 if memory allows
+num_epochs: 200
+learning_rate: 0.001  # 1e-3
+weight_decay: 0.0001  # 1e-4
+warmup_epochs: 10
+min_lr: 1e-6
+
+# VICReg specific settings
+vicreg:
+  proj_dim: 2048           # Projection head output dimension
+  proj_hidden_dim: 2048    # Hidden dimension in projection head
+  lambda_invariance: 25.0  # Weight for invariance term
+  mu_variance: 25.0        # Weight for variance term
+  nu_covariance: 1.0       # Weight for covariance term
+  gamma: 1.0               # Target standard deviation for variance term
+
+# Data augmentation (VICReg style)
+# Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur
+use_vicreg_aug: true  # Use VICReg style augmentations
+
+# Optimization settings
+compile_model: true   # Compile model with torch.compile
+use_fused_adamw: true # Use fused AdamW optimizer
+max_grad_norm: 1.0    # Gradient clipping (0 = disabled)
+
+# DataLoader settings
+num_workers: 4
+persistent_workers: false
+prefetch_factor: 2
+pin_memory: true
+
+# Checkpointing
+checkpoint_dir: "/scratch/$USER/Nov_14_distill/checkpoints_vicreg"
+save_every: 0  # Save checkpoint only at end of epoch (0 = disable step-based saving)
+

@@ -1,0 +1,16 @@
+# VICReg Model Config
+
+# Backbone model (ViT-S/16)
+backbone_name: "vit_small_patch16_224"  # ViT-S/16 from timm
+image_size: 96  # Image size for training (will override model default if needed)
+
+# Model architecture
+# ViT-S/16 default specs:
+# - Patch size: 16
+# - Embedding dim: 384
+# - Depth: 12
+# - Heads: 6
+# - CLS token + positional embeddings
+
+# Projection head is configured in train_config_vicreg.yaml under vicreg.proj_dim
+
