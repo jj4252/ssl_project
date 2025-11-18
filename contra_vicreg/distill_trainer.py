@@ -71,13 +71,13 @@ class VICRegViT(nn.Module):
         # Get embedding dimension from encoder
         embed_dim = self.encoder.num_features
         
-        # Projection head: 3-layer MLP with BatchNorm
+        # Projection head: 3-layer MLP with LayerNorm (BatchNorm causes issues in SSL)
         self.proj = nn.Sequential(
             nn.Linear(embed_dim, proj_hidden_dim),
-            nn.BatchNorm1d(proj_hidden_dim),
+            nn.LayerNorm(proj_hidden_dim),
             nn.ReLU(),
             nn.Linear(proj_hidden_dim, proj_hidden_dim),
-            nn.BatchNorm1d(proj_hidden_dim),
+            nn.LayerNorm(proj_hidden_dim),
             nn.ReLU(),
             nn.Linear(proj_hidden_dim, proj_dim),
         )
@@ -332,6 +332,28 @@ def train_vicreg(
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
+        # Data loading verification (first batch of first epoch)
+        if epoch == start_epoch:
+            # Get first batch for verification
+            first_batch_iter = iter(train_loader)
+            first_batch = next(first_batch_iter)
+            if isinstance(first_batch, (tuple, list)) and len(first_batch) == 2:
+                x1_check = first_batch[0][:4].to(device)
+                x2_check = first_batch[1][:4].to(device)
+                pixel_diff = (x1_check - x2_check).abs().mean().item()
+                print("\n🔍 Data Loading Verification:")
+                print(f"  x1 shape: {x1_check.shape}, x2 shape: {x2_check.shape}")
+                print(f"  x1 mean: {x1_check.mean():.4f}, x2 mean: {x2_check.mean():.4f}")
+                print(f"  x1-x2 pixel diff: {pixel_diff:.6f} (should be >0.1 for different views)")
+                if pixel_diff < 0.01:
+                    print(f"  ⚠️  CRITICAL: Views are nearly identical! Check augmentations!")
+                elif pixel_diff < 0.05:
+                    print(f"  ⚠️  WARNING: Views are very similar - augmentations may be too weak")
+                else:
+                    print(f"  ✓ Views are sufficiently different")
+            # Recreate iterator for actual training
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        
         for batch_idx, batch in enumerate(progress_bar):
             # Batch should be (view1, view2) tuple
             if isinstance(batch, (tuple, list)) and len(batch) == 2:
@@ -390,10 +412,31 @@ def train_vicreg(
             # Backward pass
             scaler.scale(loss).backward()
             
-            # Gradient clipping
-            if max_grad_norm > 0:
+            # Gradient clipping and monitoring
+            if max_grad_norm > 0 or (batch_idx % 50 == 0) or (epoch < 5 and batch_idx == 0):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                # Gradient monitoring (every 50 batches or first batch of first 5 epochs)
+                if (batch_idx % 50 == 0) or (epoch < 5 and batch_idx == 0):
+                    total_grad_norm = 0.0
+                    param_count = 0
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            param_norm = param.grad.data.norm(2)
+                            total_grad_norm += param_norm.item() ** 2
+                            param_count += 1
+                    if param_count > 0:
+                        total_grad_norm = total_grad_norm ** (1. / 2)
+                        if total_grad_norm < 1e-6:
+                            print(f"  ⚠️  WARNING: Very small gradient norm ({total_grad_norm:.8f}) - model may not be learning!")
+                        elif total_grad_norm < 0.001:
+                            print(f"  ⚠️  WARNING: Low gradient norm ({total_grad_norm:.6f}) - check learning rate")
+                        else:
+                            print(f"  ✓ Gradient norm: {total_grad_norm:.6f}")
+                
+                # Gradient clipping
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             
             scaler.step(optimizer)
             scaler.update()
@@ -405,6 +448,14 @@ def train_vicreg(
             total_cov += loss_dict['covariance']
             num_batches += 1
             global_step += 1
+            
+            # Enhanced loss logging (every 10 batches for first epoch, every 50 otherwise)
+            if (epoch < 1 and batch_idx % 10 == 0) or (batch_idx % 50 == 0):
+                print(f"\n  Loss breakdown (step {global_step}):")
+                print(f"    Invariance: {loss_dict['invariance']:.6f} (weighted: {lambda_inv * loss_dict['invariance']:.4f})")
+                print(f"    Variance: {loss_dict['variance']:.6f} (weighted: {mu_var * loss_dict['variance']:.4f})")
+                print(f"    Covariance: {loss_dict['covariance']:.6f} (weighted: {nu_cov * loss_dict['covariance']:.4f})")
+                print(f"    Total: {loss.item():.6f}")
             
             # Periodic diagnostics (every 50 batches or first batch of first 5 epochs)
             if (batch_idx % 50 == 0) or (epoch < 5 and batch_idx == 0):

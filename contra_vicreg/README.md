@@ -30,10 +30,12 @@ This folder contains a VICReg (Bardes et al., 2022) implementation for self-supe
    - Output: CLS token [B, 384]
 
 2. **Projection Head**: 3-layer MLP
-   - Linear(384 → 2048) + BatchNorm + ReLU
-   - Linear(2048 → 2048) + BatchNorm + ReLU
+   - Linear(384 → 2048) + LayerNorm + ReLU
+   - Linear(2048 → 2048) + LayerNorm + ReLU
    - Linear(2048 → 2048)
    - Output: [B, 2048]
+   
+   **Note**: Uses LayerNorm instead of BatchNorm (BatchNorm causes issues in SSL by normalizing across batch dimension)
 
 ### VICReg Loss
 
