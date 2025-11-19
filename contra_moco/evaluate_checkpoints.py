@@ -880,6 +880,9 @@ def main():
                         print(f"       --model_config model_config_moco_vit.yaml")
                     else:
                         print(f"       --model_config model_config_moco_resnet.yaml")
+                    print(f"\n  ⚠️  Skipping this checkpoint due to architecture mismatch.")
+                    print(f"  Please re-run evaluation with the correct model config.\n")
+                    continue  # Skip this checkpoint
                 else:
                     print(f"  ✓ Checkpoint architecture matches config ({detected_backbone.upper()})")
             elif detected_backbone:
