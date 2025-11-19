@@ -478,8 +478,10 @@ def main():
     
     # Load CIFAR datasets
     print(f"\n📦 Loading {args.dataset.upper()} datasets...")
-    train_dataset = get_cifar_dataset(args.dataset, train=True, image_size=model_config['student_img_size'])
-    test_dataset = get_cifar_dataset(args.dataset, train=False, image_size=model_config['student_img_size'])
+    # Support both 'image_size' (new) and 'student_img_size' (legacy)
+    img_size = model_config.get('image_size', model_config.get('student_img_size', 224))
+    train_dataset = get_cifar_dataset(args.dataset, train=True, image_size=img_size)
+    test_dataset = get_cifar_dataset(args.dataset, train=False, image_size=img_size)
     
     train_loader = DataLoader(
         train_dataset,
@@ -965,8 +967,9 @@ def main():
                 print(f"\n  MoCo-v3 Specific Checks:")
                 # Check if we can access forward_features
                 try:
-                    test_input = torch.randn(1, 3, model_config['student_img_size'], 
-                                           model_config['student_img_size']).to(device)
+                    # Support both 'image_size' (new) and 'student_img_size' (legacy)
+                    img_size = model_config.get('image_size', model_config.get('student_img_size', 224))
+                    test_input = torch.randn(1, 3, img_size, img_size).to(device)
                     with torch.no_grad():
                         test_output = student.forward_features(test_input)
                     print(f"    ✓ forward_features() works correctly")
