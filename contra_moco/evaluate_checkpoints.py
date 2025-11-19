@@ -30,6 +30,31 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def detect_backbone_type_from_state_dict(state_dict):
+    """
+    Detect backbone type (ViT or ResNet) from state dict keys.
+    
+    Returns:
+        'vit' if ViT architecture detected, 'resnet' if ResNet detected, None if unclear
+    """
+    keys = list(state_dict.keys())
+    
+    # ViT indicators
+    vit_indicators = ['cls_token', 'pos_embed', 'patch_embed', 'blocks.0.norm1', 'blocks.0.attn']
+    # ResNet indicators
+    resnet_indicators = ['conv1.weight', 'bn1.weight', 'layer1.0.conv1', 'layer2.0.conv1']
+    
+    vit_count = sum(1 for key in keys if any(indicator in key for indicator in vit_indicators))
+    resnet_count = sum(1 for key in keys if any(indicator in key for indicator in resnet_indicators))
+    
+    if vit_count > resnet_count and vit_count > 0:
+        return 'vit'
+    elif resnet_count > vit_count and resnet_count > 0:
+        return 'resnet'
+    else:
+        return None
+
+
 def load_checkpoint(checkpoint_path, device, mode='kd'):
     """
     Load checkpoint and return model state dict.
@@ -40,7 +65,7 @@ def load_checkpoint(checkpoint_path, device, mode='kd'):
         mode: 'kd' (knowledge distillation) or 'moco_v3' (contrastive learning)
     
     Returns:
-        State dict for the encoder (student for KD, encoder_q for MoCo)
+        Tuple of (state_dict, detected_backbone_type)
     """
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -87,7 +112,10 @@ def load_checkpoint(checkpoint_path, device, mode='kd'):
                 new_state_dict[key] = value
         state_dict = new_state_dict
     
-    return state_dict
+    # Detect backbone type from state dict
+    detected_backbone = detect_backbone_type_from_state_dict(state_dict)
+    
+    return state_dict, detected_backbone
 
 
 def build_student_model(model_config, device):
@@ -96,23 +124,46 @@ def build_student_model(model_config, device):
     model_name = model_config.get('backbone_name', model_config.get('student_name', 'vit_small_patch16_224'))
     img_size = model_config.get('image_size', model_config.get('student_img_size', 224))
     
-    print(f"Building student model: {model_name} with img_size={img_size}")
+    # Get backbone type from config (for explicit control)
+    backbone_type = model_config.get('backbone_type', 'auto')
     
-    # Try to create model with custom img_size
-    try:
+    # Auto-detect if not explicitly set
+    if backbone_type == 'auto':
+        if 'resnet' in model_name.lower():
+            backbone_type = 'resnet'
+        elif 'vit' in model_name.lower():
+            backbone_type = 'vit'
+        else:
+            backbone_type = 'vit'  # Default to ViT
+    
+    print(f"Building student model: {model_name} with img_size={img_size} (backbone_type={backbone_type})")
+    
+    # ResNet models don't accept img_size parameter
+    if backbone_type == 'resnet':
         student = timm.create_model(
             model_name,
             pretrained=False,
-            img_size=img_size,
             num_classes=0,  # No classification head
+            global_pool="avg",  # Global average pooling for ResNet
         )
-    except Exception as e:
-        print(f"  Warning: Could not create model with img_size={img_size}, trying default size first...")
-        student = timm.create_model(
-            model_name,
-            pretrained=False,
-            num_classes=0,
-        )
+    else:
+        # ViT models: Try to create model with custom img_size
+        try:
+            student = timm.create_model(
+                model_name,
+                pretrained=False,
+                img_size=img_size,
+                num_classes=0,  # No classification head
+                global_pool="",  # Don't pool, return all tokens for ViT
+            )
+        except Exception as e:
+            print(f"  Warning: Could not create model with img_size={img_size}, trying default size first...")
+            student = timm.create_model(
+                model_name,
+                pretrained=False,
+                num_classes=0,
+                global_pool="",
+            )
     
     # Always patch patch_embed to ensure it matches desired img_size
     if hasattr(student, 'patch_embed'):
@@ -448,7 +499,21 @@ def main():
     
     # Load config
     model_config = load_config(args.model_config)
-    use_cls_token = model_config.get('use_cls_token', True)
+    
+    # Auto-detect use_cls_token based on backbone type
+    backbone_type = model_config.get('backbone_type', 'auto')
+    if backbone_type == 'auto':
+        model_name = model_config.get('backbone_name', model_config.get('student_name', ''))
+        if 'resnet' in model_name.lower():
+            backbone_type = 'resnet'
+        elif 'vit' in model_name.lower():
+            backbone_type = 'vit'
+    
+    # ResNet doesn't use CLS token, ViT does
+    if backbone_type == 'resnet':
+        use_cls_token = False
+    else:
+        use_cls_token = model_config.get('use_cls_token', True)
     
     # Print mode
     print(f"✓ Evaluation mode: {args.mode}")
@@ -793,7 +858,32 @@ def main():
             elif file_size < 10 * 1024 * 1024:  # Less than 10MB is suspicious for a model checkpoint
                 print(f"  ⚠️  Warning: Checkpoint file seems small ({file_size / 1024 / 1024:.2f} MB)")
             
-            state_dict = load_checkpoint(checkpoint_path, device, mode=args.mode)
+            state_dict, detected_backbone = load_checkpoint(checkpoint_path, device, mode=args.mode)
+            
+            # Check if checkpoint architecture matches config
+            config_backbone_type = model_config.get('backbone_type', 'auto')
+            if config_backbone_type == 'auto':
+                model_name = model_config.get('backbone_name', model_config.get('student_name', ''))
+                if 'resnet' in model_name.lower():
+                    config_backbone_type = 'resnet'
+                elif 'vit' in model_name.lower():
+                    config_backbone_type = 'vit'
+            
+            if detected_backbone and config_backbone_type != 'auto':
+                if detected_backbone != config_backbone_type:
+                    print(f"\n  ❌ CRITICAL ERROR: Architecture mismatch!")
+                    print(f"     Checkpoint contains {detected_backbone.upper()} weights")
+                    print(f"     But config specifies {config_backbone_type.upper()} architecture")
+                    print(f"     This will cause loading to fail. Please use the correct model config.")
+                    print(f"     For {detected_backbone.upper()} checkpoints, use:")
+                    if detected_backbone == 'vit':
+                        print(f"       --model_config model_config_moco_vit.yaml")
+                    else:
+                        print(f"       --model_config model_config_moco_resnet.yaml")
+                else:
+                    print(f"  ✓ Checkpoint architecture matches config ({detected_backbone.upper()})")
+            elif detected_backbone:
+                print(f"  ℹ️  Detected checkpoint architecture: {detected_backbone.upper()}")
             
             # ============================================================
             # DIAGNOSTIC: Checkpoint loading verification (MoCo-v3)
