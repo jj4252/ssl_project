@@ -186,7 +186,7 @@ class TensorSimpleTransform:
     Simple single-crop transform for cached tensors.
     Replicates SimpleTransform but works on unnormalized tensors [0, 1].
     """
-    def __init__(self, image_size: int = 224, scale: Tuple[float, float] = (0.2, 1.0)):
+    def __init__(self, image_size: int = 96, scale: Tuple[float, float] = (0.2, 1.0)):
         self.image_size = image_size
         self.scale = scale
         # ImageNet normalization stats
@@ -203,18 +203,6 @@ class TensorSimpleTransform:
         Returns:
             Augmented and normalized tensor [C, H, W]
         """
-        # Safety: Ensure input is resized to target size first if it doesn't match
-        # This handles cases where cached tensors are a different size (e.g., 224x224 cache, 96x96 target)
-        C, H, W = img.shape
-        if H != self.image_size or W != self.image_size:
-            # Resize to target size first, then apply random crop
-            img = F.interpolate(
-                img.unsqueeze(0),
-                size=(self.image_size, self.image_size),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-        
         # Random resized crop
         img = random_resized_crop_tensor(img, (self.image_size, self.image_size), scale=self.scale)
         
@@ -251,7 +239,7 @@ class TensorMultiCropTransform:
         global_crops_scale: Tuple[float, float] = (0.4, 1.0),
         local_crops_scale: Tuple[float, float] = (0.05, 0.4),
         local_crops_number: int = 0,
-        image_size: int = 224,
+        image_size: int = 96,
         use_local_crops: bool = False
     ):
         self.global_crops_scale = global_crops_scale
