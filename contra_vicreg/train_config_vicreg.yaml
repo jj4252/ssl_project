@@ -7,19 +7,20 @@ training_mode: "vicreg"
 # Training hyperparameters
 batch_size: 128  # Keep at 128 - VICReg's memory issue is from large proj_dim (2048) and covariance matrices [2048x2048], not just batch size
 num_epochs: 200
-learning_rate: 0.0003  # Further reduced from 0.0005 for stability (gradient norm is high: 6.08)
+learning_rate: 0.0002  # Further reduced to allow variance/covariance terms to prevent collapse
 weight_decay: 0.0001  # 1e-4
 warmup_epochs: 10
 min_lr: 1e-6
 
 # VICReg specific settings
+# Config B (Anti-collapse): Aggressive variance/covariance to prevent collapse
 vicreg:
   proj_dim: 2048           # Projection head output dimension
   proj_hidden_dim: 2048    # Hidden dimension in projection head
-  lambda_invariance: 10.0  # Weight for invariance term (aggressively reduced from 20.0 to prevent over-pulling)
-  mu_variance: 25.0        # Weight for variance term
-  nu_covariance: 15.0      # Weight for covariance term (aggressively increased from 5.0 to prevent complete collapse)
-  gamma: 2.0               # Target standard deviation for variance term (increased from 1.5 to encourage more variance)
+  lambda_invariance: 0.5   # Weight for invariance term (further reduced - let variance/covariance dominate)
+  mu_variance: 50.0        # Weight for variance term (doubled - force higher variance)
+  nu_covariance: 50.0      # Weight for covariance term (doubled - stronger decorrelation)
+  gamma: 2.0               # Target standard deviation (increased from 1.0 - force higher variance)
 
 # Data augmentation (VICReg style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur
@@ -28,7 +29,7 @@ use_vicreg_aug: true  # Use VICReg style augmentations
 # Optimization settings
 compile_model: true   # Compile model with torch.compile
 use_fused_adamw: true # Use fused AdamW optimizer
-max_grad_norm: 0.5    # Gradient clipping (reduced from 1.0 - gradient norm was 6.08, needs stricter clipping)
+max_grad_norm: 0.5    # Gradient clipping (keep at 0.5 for stability)
 
 # DataLoader settings (reduced to prevent OOM)
 num_workers: 2  # Reduced from 4 to match data_config and prevent OOM
