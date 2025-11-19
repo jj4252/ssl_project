@@ -67,11 +67,26 @@ def load_checkpoint(checkpoint_path, device, mode='kd'):
         # We only need the encoder for evaluation
         if 'model' in checkpoint:
             full_state = checkpoint['model']
+            
+            # First, handle torch.compile() prefix: compiled models have '_orig_mod.' prefix
+            # Strip this prefix if present (keys might be '_orig_mod.encoder.cls_token')
+            if any(key.startswith('_orig_mod.') for key in full_state.keys()):
+                print(f"  Detected compiled model checkpoint (has '_orig_mod.' prefix), stripping prefix...")
+                temp_state = {}
+                for key, value in full_state.items():
+                    if key.startswith('_orig_mod.'):
+                        new_key = key[len('_orig_mod.'):]
+                        temp_state[new_key] = value
+                    else:
+                        temp_state[key] = value
+                full_state = temp_state
+            
             # Extract encoder state dict (keys starting with 'encoder.')
+            # After stripping '_orig_mod.', keys should be 'encoder.cls_token', etc.
             encoder_state = {}
             for key, value in full_state.items():
                 if key.startswith('encoder.'):
-                    new_key = key[len('encoder.'):]
+                    new_key = key[len('encoder.'):]  # Remove 'encoder.' prefix
                     encoder_state[new_key] = value
             if encoder_state:
                 state_dict = encoder_state
