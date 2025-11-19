@@ -108,6 +108,24 @@ class VICRegViT(nn.Module):
         z = self.proj(cls_features)  # [B, proj_dim]
         
         return z
+    
+    def forward_features(self, x):
+        """
+        Extract encoder features (h) without projection.
+        Used for linear probing evaluation.
+        
+        Args:
+            x: Input images [B, C, H, W]
+        
+        Returns:
+            CLS token features [B, embed_dim]
+        """
+        features = self.encoder.forward_features(x)
+        if isinstance(features, torch.Tensor):
+            cls_features = features[:, 0]  # [B, embed_dim]
+        else:
+            cls_features = features.get('x', features.get('tokens', None))[:, 0]
+        return cls_features
 
 
 def invariance_loss(z1, z2):
