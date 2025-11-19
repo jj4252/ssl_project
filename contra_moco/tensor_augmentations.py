@@ -203,6 +203,18 @@ class TensorSimpleTransform:
         Returns:
             Augmented and normalized tensor [C, H, W]
         """
+        # Safety: Ensure input is resized to target size first if it doesn't match
+        # This handles cases where cached tensors are a different size (e.g., 224x224 cache, 96x96 target)
+        C, H, W = img.shape
+        if H != self.image_size or W != self.image_size:
+            # Resize to target size first, then apply random crop
+            img = F.interpolate(
+                img.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+        
         # Random resized crop
         img = random_resized_crop_tensor(img, (self.image_size, self.image_size), scale=self.scale)
         
