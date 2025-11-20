@@ -7,20 +7,20 @@ training_mode: "vicreg"
 # Training hyperparameters
 batch_size: 128  # Keep at 128 - VICReg's memory issue is from large proj_dim (2048) and covariance matrices [2048x2048], not just batch size
 num_epochs: 200
-learning_rate: 0.0003  # Reverted to original (was 0.0002 in Config B)
+learning_rate: 0.0002  # Reduced to allow variance/covariance terms to prevent collapse
 weight_decay: 0.0001  # 1e-4
 warmup_epochs: 10
 min_lr: 1e-6
 
 # VICReg specific settings
-# Config A (Original - gave ~57% accuracy): Rebalanced loss to prevent feature collapse
+# Config C (Anti-Collapse): Aggressive variance/covariance to prevent feature collapse
 vicreg:
   proj_dim: 2048           # Projection head output dimension
   proj_hidden_dim: 2048    # Hidden dimension in projection head
-  lambda_invariance: 1.0  # Weight for invariance term (reverted from 0.5)
-  mu_variance: 25.0        # Weight for variance term (reverted from 50.0)
-  nu_covariance: 25.0      # Weight for covariance term (reverted from 50.0)
-  gamma: 1.0               # Target standard deviation (reverted from 2.0)
+  lambda_invariance: 1.0  # Weight for invariance term (keep at 1.0)
+  mu_variance: 50.0        # Weight for variance term (increased from 25.0 → 50.0 to force higher variance)
+  nu_covariance: 50.0      # Weight for covariance term (increased from 25.0 → 50.0 to reduce correlation)
+  gamma: 1.5               # Target standard deviation (increased from 1.0 → 1.5 to force higher variance)
 
 # Data augmentation (VICReg style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur
