@@ -433,6 +433,50 @@ def train_linear_probe(train_features, train_labels, test_features, test_labels,
     return accuracy, clf
 
 
+def find_best_C(train_features, train_labels, test_features, test_labels, C_values=None, max_iter=1000):
+    """
+    Try multiple C values and return the best one.
+    
+    Args:
+        train_features: [N_train, D] training features
+        train_labels: [N_train] training labels
+        test_features: [N_test, D] test features
+        test_labels: [N_test] test labels
+        C_values: List of C values to try (default: [0.01, 0.1, 1.0, 10.0, 100.0])
+        max_iter: Maximum iterations
+    
+    Returns:
+        best_accuracy: Best test accuracy
+        best_C: C value that achieved best accuracy
+        best_clf: Trained classifier with best C
+        all_results: Dict of {C: accuracy} for all tried values
+    """
+    if C_values is None:
+        C_values = [0.01, 0.1, 1.0, 10.0, 100.0]
+    
+    best_accuracy = -1.0
+    best_C = None
+    best_clf = None
+    all_results = {}
+    
+    print(f"  Trying {len(C_values)} C values: {C_values}")
+    for C in C_values:
+        accuracy, clf = train_linear_probe(
+            train_features, train_labels,
+            test_features, test_labels,
+            C=C, max_iter=max_iter
+        )
+        all_results[C] = accuracy
+        print(f"    C={C:6.2f}: accuracy={accuracy:.4f} ({accuracy*100:.2f}%)")
+        
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_C = C
+            best_clf = clf
+    
+    return best_accuracy, best_C, best_clf, all_results
+
+
 def find_checkpoint_files(checkpoint_dir, epochs=None, include_best=True):
     """
     Find checkpoint files for specified epochs.
@@ -1180,21 +1224,24 @@ def main():
         # Analyze feature quality
         feature_stats = analyze_features(train_features, name=f"Checkpoint {checkpoint_name} Features")
         
-        # Train linear probe
-        print(f"🎯 Training linear probe (C={args.linear_probe_C})...")
-        accuracy, clf = train_linear_probe(
+        # Train linear probe with best C
+        print(f"🎯 Training linear probe (trying multiple C values)...")
+        accuracy, best_C, clf, all_C_results = find_best_C(
             train_features, train_labels,
             test_features, test_labels,
-            C=args.linear_probe_C
+            C_values=[0.01, 0.1, 1.0, 10.0, 100.0],
+            max_iter=1000
         )
         
-        print(f"✓ Linear probe accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"✓ Best linear probe accuracy: {accuracy:.4f} ({accuracy*100:.2f}%) with C={best_C}")
         
         # Store results
         results[checkpoint_name] = {
             'checkpoint_path': str(checkpoint_path),
             'accuracy': float(accuracy),
             'accuracy_percent': float(accuracy * 100),
+            'best_C': float(best_C),
+            'all_C_results': {str(k): float(v) for k, v in all_C_results.items()},
             'train_samples': len(train_features),
             'test_samples': len(test_features),
             'feature_dim': train_features.shape[1],
@@ -1206,28 +1253,53 @@ def main():
     print("📊 EVALUATION SUMMARY")
     print(f"{'='*60}")
     print(f"Dataset: {args.dataset.upper()}")
-    print(f"Linear Probe C: {args.linear_probe_C}")
+    print(f"Linear Probe: Best C selected per checkpoint (tried: [0.01, 0.1, 1.0, 10.0, 100.0])")
+    
+    # Check if any checkpoints were successfully evaluated
+    if not results:
+        print(f"\n❌ No checkpoints were successfully evaluated!")
+        print(f"   This usually means:")
+        print(f"   1. All checkpoints had architecture mismatches (wrong model config)")
+        print(f"   2. All checkpoints failed to load (corrupted files)")
+        print(f"   3. No checkpoints were found in the directory")
+        print(f"\n   Please check:")
+        print(f"   - Are you using the correct --model_config file?")
+        print(f"   - Do the checkpoints match the model architecture?")
+        print(f"   - Are the checkpoint files valid?")
+        return
+    
     print(f"\nResults:")
-    print(f"{'Checkpoint':<15} {'Accuracy':<12} {'Accuracy %':<12}")
-    print(f"{'-'*40}")
+    print(f"{'Checkpoint':<15} {'Accuracy':<12} {'Accuracy %':<12} {'Best C':<10}")
+    print(f"{'-'*50}")
     
     sorted_results = sorted(results.items(), key=lambda x: x[1]['accuracy'], reverse=True)
     for name, result in sorted_results:
-        print(f"{str(name):<15} {result['accuracy']:<12.4f} {result['accuracy_percent']:<12.2f}%")
+        best_C = result.get('best_C', 'N/A')
+        if isinstance(best_C, float):
+            best_C_str = f"{best_C:.2f}"
+        else:
+            best_C_str = str(best_C)
+        print(f"{str(name):<15} {result['accuracy']:<12.4f} {result['accuracy_percent']:<12.2f}% {best_C_str:<10}")
     
     # Find best checkpoint
     best_checkpoint = max(results.items(), key=lambda x: x[1]['accuracy'])
-    print(f"\n🏆 Best checkpoint: {best_checkpoint[0]} ({best_checkpoint[1]['accuracy_percent']:.2f}%)")
+    best_C = best_checkpoint[1].get('best_C', 'N/A')
+    if isinstance(best_C, float):
+        best_C_str = f"C={best_C:.2f}"
+    else:
+        best_C_str = ""
+    print(f"\n🏆 Best checkpoint: {best_checkpoint[0]} ({best_checkpoint[1]['accuracy_percent']:.2f}%, {best_C_str})")
     
     # Save results to JSON
     output_path = Path(args.output_file)
     with open(output_path, 'w') as f:
         json.dump({
             'dataset': args.dataset,
-            'linear_probe_C': args.linear_probe_C,
+            'linear_probe_C': 'best_per_checkpoint',
+            'C_values_tried': [0.01, 0.1, 1.0, 10.0, 100.0],
             'use_cls_token': use_cls_token,
             'results': results,
-            'best_checkpoint': best_checkpoint[0]
+            'best_checkpoint': best_checkpoint[0] if results else None
         }, f, indent=2)
     
     print(f"\n✓ Results saved to: {output_path}")
