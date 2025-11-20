@@ -25,7 +25,7 @@ vicreg:
 # Data augmentation (VICReg style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale, GaussianBlur
 use_vicreg_aug: true  # Use VICReg style augmentations
-
+## DEBUG 
 # Optimization settings
 compile_model: true   # Compile model with torch.compile
 use_fused_adamw: true # Use fused AdamW optimizer
