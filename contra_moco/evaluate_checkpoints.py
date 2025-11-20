@@ -452,7 +452,7 @@ def find_best_C(train_features, train_labels, test_features, test_labels, C_valu
         all_results: Dict of {C: accuracy} for all tried values
     """
     if C_values is None:
-        C_values = [0.01, 0.1, 1.0, 10.0, 100.0]
+        C_values = [0.01, 0.1, 1.0, 10.0, 100.0, 500.0, 1000.0]
     
     best_accuracy = -1.0
     best_C = None
@@ -1229,7 +1229,7 @@ def main():
         accuracy, best_C, clf, all_C_results = find_best_C(
             train_features, train_labels,
             test_features, test_labels,
-            C_values=[0.01, 0.1, 1.0, 10.0, 100.0],
+            C_values=[0.01, 0.1, 1.0, 10.0, 100.0, 500.0, 1000.0],
             max_iter=1000
         )
         
@@ -1253,7 +1253,7 @@ def main():
     print("📊 EVALUATION SUMMARY")
     print(f"{'='*60}")
     print(f"Dataset: {args.dataset.upper()}")
-    print(f"Linear Probe: Best C selected per checkpoint (tried: [0.01, 0.1, 1.0, 10.0, 100.0])")
+    print(f"Linear Probe: Best C selected per checkpoint (tried: [0.01, 0.1, 1.0, 10.0, 100.0, 500.0, 1000.0])")
     
     # Check if any checkpoints were successfully evaluated
     if not results:
@@ -1296,7 +1296,7 @@ def main():
         json.dump({
             'dataset': args.dataset,
             'linear_probe_C': 'best_per_checkpoint',
-            'C_values_tried': [0.01, 0.1, 1.0, 10.0, 100.0],
+            'C_values_tried': [0.01, 0.1, 1.0, 10.0, 100.0, 500.0, 1000.0],
             'use_cls_token': use_cls_token,
             'results': results,
             'best_checkpoint': best_checkpoint[0] if results else None
