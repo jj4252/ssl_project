@@ -2122,13 +2122,39 @@ def run_moco_training(data_cfg, train_cfg, model_cfg, device, args):
     print(f"  Trainable parameters: {trainable_params / 1e6:.2f}M")
     print(f"  (encoder_k + proj_k are frozen, updated via momentum)")
     
+    # Warn if trainable parameters exceed 100M
+    if trainable_params > 100e6:
+        print(f"  ⚠️  WARNING: Trainable parameters ({trainable_params / 1e6:.2f}M) exceed 100M limit!")
+        print(f"     Consider using a smaller model or reducing projection head size.")
+    
     # Build DataLoader (should return two views per image)
     print("\nBuilding DataLoader...")
     dataloader = build_pretraining_dataloader(data_cfg, train_cfg)
     
-    # Checkpoint directory
-    checkpoint_dir = train_cfg.get('checkpoint_dir', './checkpoints')
-    checkpoint_dir = os.path.expandvars(checkpoint_dir)
+    # Checkpoint directory - automatically append model name
+    base_checkpoint_dir = train_cfg.get('checkpoint_dir', './checkpoints')
+    base_checkpoint_dir = os.path.expandvars(base_checkpoint_dir)
+    
+    # Extract model name from backbone_name (e.g., "vit_small_patch16_224" -> "vit_small")
+    # Handle various naming patterns: "vit_small_patch16_224", "resnet50", etc.
+    if '_' in backbone_name:
+        parts = backbone_name.split('_')
+        # For ViT models: take first two parts (e.g., "vit_small")
+        # For other models: take first part (e.g., "resnet")
+        if 'vit' in backbone_name.lower():
+            model_name = '_'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+        else:
+            model_name = parts[0]
+    else:
+        model_name = backbone_name
+    
+    # Clean up model name for directory (remove special chars)
+    model_name = model_name.replace('/', '_').replace('\\', '_')
+    
+    # Create model-specific checkpoint directory
+    checkpoint_dir = os.path.join(base_checkpoint_dir, model_name)
+    print(f"\nCheckpoint directory: {checkpoint_dir}")
+    
     save_every = train_cfg.get('save_every', 0)  # 0 = only at end of epoch
     
     # Auto-detect latest checkpoint if resume_from not provided and auto-resume enabled

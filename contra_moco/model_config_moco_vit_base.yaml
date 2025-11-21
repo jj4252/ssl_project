@@ -1,0 +1,13 @@
+# MoCo-v3 Model Config for Vision Transformer Base (ViT-B/16)
+# NOTE: ViT-Base has ~86M trainable parameters (encoder_q + proj_q)
+# This is under the 100M limit but close - monitor memory usage
+# If you need more headroom, consider reducing proj_hidden_dim in train_config_moco.yaml
+
+# Backbone configuration
+backbone_name: "vit_base_patch16_224"  # ViT-B/16 from timm (~86M trainable params, under 100M limit)
+backbone_type: "vit"  # Explicitly set to "vit" (or "auto" for auto-detection)
+image_size: 96  # Image size for training (CIFAR-10 upscaled or custom dataset)
+
+# Model architecture
+use_cls_token: true  # Use CLS token for ViT (always true for ViT)
+

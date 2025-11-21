@@ -6,7 +6,7 @@ training_mode: "moco_v3"
 
 # Training hyperparameters
 batch_size: 256
-num_epochs: 200
+num_epochs: 800
 learning_rate: 0.0005  # Reduced from 0.001 to 0.0005 for stability (collapse happening too early)
 weight_decay: 0.05
 warmup_epochs: 10
@@ -17,10 +17,10 @@ moco:
   proj_dim: 256           # Projection head output dimension
   proj_hidden_dim: 1024   # Hidden dimension in projection head (384 → 1024 → 256, set to 0 to use embed_dim)
   queue_size: 65536       # Number of negative keys in queue (try 4096 for debugging if collapse persists)
-  momentum: 0.90          # EMA momentum for key encoder (reduced from 0.95 for faster updates to prevent collapse)
-  momentum_anneal: true   # If true, anneal momentum from initial value to 0.99 over training
-  temperature: 0.8        # InfoNCE temperature (increased from 0.7 to 0.8 - moderate increase to prevent collapse)
-  use_queue: false        # Temporarily disabled to test if queue is causing early collapse (set to true to re-enable)
+  momentum: 0.99          # EMA momentum for key encoder (reduced from 0.95 for faster updates to prevent collapse)
+  momentum_anneal: false   # If true, anneal momentum from initial value to 0.99 over training
+  temperature: 0.2       # InfoNCE temperature (increased from 0.7 to 0.8 - moderate increase to prevent collapse)
+  use_queue: true        # Temporarily disabled to test if queue is causing early collapse (set to true to re-enable)
 
 # Data augmentation (MoCo-v3 style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale
@@ -38,6 +38,9 @@ prefetch_factor: 2
 pin_memory: true
 
 # Checkpointing
+# Note: checkpoint_dir is a BASE directory - model name will be automatically appended
+# e.g., if checkpoint_dir="/scratch/$USER/checkpoints_moco" and model is "vit_base_patch16_224",
+# checkpoints will be saved to "/scratch/$USER/checkpoints_moco/vit_base"
 checkpoint_dir: "/scratch/$USER/Nov_14_distill/checkpoints_moco"
 save_every: 0  # Save checkpoint only at end of epoch (0 = disable step-based saving)
 
