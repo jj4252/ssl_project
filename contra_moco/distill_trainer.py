@@ -556,7 +556,12 @@ class MoCoModel(nn.Module):
             k = self.proj_k(k_features)  # [B, proj_dim]
             k = F.normalize(k, dim=-1)  # L2 normalize
         
-        losses = []
+        # Count number of crops for averaging
+        num_crops = 1  # Start with global crop
+        if im_local1 is not None:
+            num_crops += 1
+        if im_local2 is not None:
+            num_crops += 1
         
         # -----------------
         # Global crop 1 (query) vs Global crop 2 (key)
@@ -566,7 +571,8 @@ class MoCoModel(nn.Module):
         q = F.normalize(q, dim=-1)  # L2 normalize
         
         loss_global = self._compute_contrastive_loss(q, k, batch_size)
-        losses.append(loss_global)
+        # Accumulate loss incrementally (divide by num_crops to get average)
+        total_loss = loss_global / num_crops
         
         # Free memory: delete intermediate tensors for global crop
         del q_features, q
@@ -582,10 +588,11 @@ class MoCoModel(nn.Module):
             q_local1 = F.normalize(q_local1, dim=-1)  # L2 normalize
             
             loss_local1 = self._compute_contrastive_loss(q_local1, k, batch_size)
-            losses.append(loss_local1)
+            # Accumulate loss incrementally
+            total_loss = total_loss + loss_local1 / num_crops
             
             # Free memory: delete intermediate tensors (process sequentially to reduce peak memory)
-            del q_local1_features, q_local1
+            del q_local1_features, q_local1, loss_local1
         
         if im_local2 is not None:
             assert im_local2.shape == im_q.shape, f"im_local2 shape mismatch: {im_local2.shape} vs {im_q.shape}"
@@ -594,13 +601,11 @@ class MoCoModel(nn.Module):
             q_local2 = F.normalize(q_local2, dim=-1)  # L2 normalize
             
             loss_local2 = self._compute_contrastive_loss(q_local2, k, batch_size)
-            losses.append(loss_local2)
+            # Accumulate loss incrementally
+            total_loss = total_loss + loss_local2 / num_crops
             
             # Free memory: delete intermediate tensors
-            del q_local2_features, q_local2
-        
-        # Average all losses
-        total_loss = sum(losses) / len(losses)
+            del q_local2_features, q_local2, loss_local2
         
         # Update queue with new keys (detached, normalized) - only if using queue
         # CRITICAL: Must use k (key), NEVER q (query)

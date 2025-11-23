@@ -5,9 +5,11 @@
 training_mode: "moco_v3"
 
 # Training hyperparameters
-# NOTE: With use_moco_multicrop=true, reduce batch_size to avoid OOM (e.g., 128 or 64)
+# CRITICAL: With use_moco_multicrop=true, you MUST reduce batch_size to avoid OOM
 # Multi-crop processes 4 crops per image (vs 2 for standard MoCo), effectively doubling memory usage
-batch_size: 256
+# Recommended: batch_size: 128 or 64 for multi-crop with ViT-Base/8
+# If still OOM, try: batch_size: 64 or even 32
+batch_size: 128  # Reduced from 256 for multi-crop
 num_epochs: 800
 learning_rate: 0.0005  # Reduced from 0.001 to 0.0005 for stability (collapse happening too early)
 weight_decay: 0.05
@@ -16,8 +18,8 @@ min_lr: 1e-6
 
 # MoCo-v3 specific settings
 moco:
-  proj_dim: 256           # Projection head output dimension
-  proj_hidden_dim: 1024   # Hidden dimension in projection head (384 → 1024 → 256, set to 0 to use embed_dim)
+  proj_dim: 512           # Projection head output dimension
+  proj_hidden_dim: 2048   # Hidden dimension in projection head (384 → 1024 → 256, set to 0 to use embed_dim)
   queue_size: 65536       # Number of negative keys in queue (try 4096 for debugging if collapse persists)
   momentum: 0.99          # EMA momentum for key encoder (reduced from 0.95 for faster updates to prevent collapse)
   momentum_anneal: false   # If true, anneal momentum from initial value to 0.99 over training
