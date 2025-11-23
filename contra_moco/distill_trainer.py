@@ -524,16 +524,19 @@ class MoCoModel(nn.Module):
                 feat = F.adaptive_avg_pool2d(feat, (1, 1)).flatten(1)
         return feat
     
-    def forward_moco(self, im_q: torch.Tensor, im_k: torch.Tensor) -> torch.Tensor:
+    def forward_moco(self, im_q: torch.Tensor, im_k: torch.Tensor, 
+                     im_local1: torch.Tensor = None, im_local2: torch.Tensor = None) -> torch.Tensor:
         """
-        Forward pass for MoCo-v3 contrastive learning.
+        Forward pass for MoCo-v3 contrastive learning with optional multi-crop support.
         
         Args:
-            im_q: Query images [B, C, H, W]
-            im_k: Key images [B, C, H, W] (different augmentation of same images)
+            im_q: Query images (global crop 1) [B, C, H, W]
+            im_k: Key images (global crop 2) [B, C, H, W] (different augmentation of same images)
+            im_local1: Optional local crop 1 [B, C, H, W]
+            im_local2: Optional local crop 2 [B, C, H, W]
         
         Returns:
-            Contrastive loss (InfoNCE)
+            Contrastive loss (InfoNCE), averaged over all crops
         """
         batch_size = im_q.shape[0]
         
@@ -542,14 +545,7 @@ class MoCoModel(nn.Module):
         assert batch_size > 0, "Batch size must be positive"
         
         # -----------------
-        # Query branch
-        # -----------------
-        q_features = self._extract_features(self.encoder_q, im_q)  # [B, embed_dim]
-        q = self.proj_q(q_features)  # [B, proj_dim]
-        q = F.normalize(q, dim=-1)  # L2 normalize
-        
-        # -----------------
-        # Key branch (with momentum update)
+        # Key branch (with momentum update) - computed once for all queries
         # -----------------
         with torch.no_grad():
             # Update momentum encoder (EMA update)
@@ -560,9 +556,64 @@ class MoCoModel(nn.Module):
             k = self.proj_k(k_features)  # [B, proj_dim]
             k = F.normalize(k, dim=-1)  # L2 normalize
         
+        losses = []
+        
         # -----------------
-        # Compute logits
+        # Global crop 1 (query) vs Global crop 2 (key)
         # -----------------
+        q_features = self._extract_features(self.encoder_q, im_q)  # [B, embed_dim]
+        q = self.proj_q(q_features)  # [B, proj_dim]
+        q = F.normalize(q, dim=-1)  # L2 normalize
+        
+        loss_global = self._compute_contrastive_loss(q, k, batch_size)
+        losses.append(loss_global)
+        
+        # -----------------
+        # Local crops (if provided) - each contrasts against global key
+        # -----------------
+        if im_local1 is not None:
+            assert im_local1.shape == im_q.shape, f"im_local1 shape mismatch: {im_local1.shape} vs {im_q.shape}"
+            q_local1_features = self._extract_features(self.encoder_q, im_local1)  # [B, embed_dim]
+            q_local1 = self.proj_q(q_local1_features)  # [B, proj_dim]
+            q_local1 = F.normalize(q_local1, dim=-1)  # L2 normalize
+            
+            loss_local1 = self._compute_contrastive_loss(q_local1, k, batch_size)
+            losses.append(loss_local1)
+        
+        if im_local2 is not None:
+            assert im_local2.shape == im_q.shape, f"im_local2 shape mismatch: {im_local2.shape} vs {im_q.shape}"
+            q_local2_features = self._extract_features(self.encoder_q, im_local2)  # [B, embed_dim]
+            q_local2 = self.proj_q(q_local2_features)  # [B, proj_dim]
+            q_local2 = F.normalize(q_local2, dim=-1)  # L2 normalize
+            
+            loss_local2 = self._compute_contrastive_loss(q_local2, k, batch_size)
+            losses.append(loss_local2)
+        
+        # Average all losses
+        total_loss = sum(losses) / len(losses)
+        
+        # Update queue with new keys (detached, normalized) - only if using queue
+        # CRITICAL: Must use k (key), NEVER q (query)
+        if self.use_queue:
+            with torch.no_grad():
+                # Explicitly verify we're enqueueing k, not q
+                assert k.requires_grad == False, "k must be detached before enqueueing!"
+                self._dequeue_and_enqueue(k)  # k is the key, q is the query - NEVER enqueue q!
+        
+        return total_loss
+    
+    def _compute_contrastive_loss(self, q: torch.Tensor, k: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Compute InfoNCE contrastive loss between queries and keys.
+        
+        Args:
+            q: Query features [B, proj_dim], normalized
+            k: Key features [B, proj_dim], normalized
+            batch_size: Batch size
+        
+        Returns:
+            InfoNCE loss
+        """
         # Positive: q · k+ (same index in batch)
         # Element-wise dot product: [B] -> [B, 1]
         logits_pos = torch.einsum("bd,bd->b", [q, k]).unsqueeze(-1)  # [B, 1]
@@ -588,10 +639,6 @@ class MoCoModel(nn.Module):
             logits_all = torch.einsum("bd,cd->bc", [q, k])  # [B, B]
             
             # Positive is on diagonal, negatives are off-diagonal
-            # Extract positive (diagonal) and negatives (off-diagonal)
-            # For each sample, positive is at its own index, negatives are all others
-            # We'll use a mask to set positive to a high value and negatives to low values
-            # Actually, simpler: use logits_all directly, with targets as diagonal indices
             logits = logits_all  # [B, B]
             
             # Targets: diagonal indices (0, 1, 2, ..., B-1)
@@ -627,15 +674,6 @@ class MoCoModel(nn.Module):
         
         # InfoNCE loss
         loss = F.cross_entropy(logits, targets)
-        
-        # Update queue with new keys (detached, normalized) - only if using queue
-        # CRITICAL: Must use k (key), NEVER q (query)
-        if self.use_queue:
-            with torch.no_grad():
-                # Explicitly verify we're enqueueing k, not q
-                assert k.requires_grad == False, "k must be detached before enqueueing!"
-                self._dequeue_and_enqueue(k)  # k is the key, q is the query - NEVER enqueue q!
-        
         return loss
 
 
@@ -1589,41 +1627,77 @@ def train_moco(model, train_loader, num_epochs, device,
         # Augmentation sanity check (once, at the very start of training)
         if epoch == start_epoch:
             print("\n🔍 Augmentation Sanity Check:")
-            print("  Verifying that im_q and im_k are genuinely different views...")
+            print("  Verifying that crops are genuinely different views...")
             # Get first batch from a fresh iterator (don't consume progress_bar)
             first_batch = next(iter(train_loader))
-            if isinstance(first_batch, (tuple, list)) and len(first_batch) == 2:
-                im_q_check = first_batch[0][:4].to(device)  # First 4 samples
-                im_k_check = first_batch[1][:4].to(device)
-                
-                # Compute pixel-wise difference
-                pixel_diff = (im_q_check - im_k_check).abs().mean().item()
-                pixel_std_q = im_q_check.std().item()
-                pixel_std_k = im_k_check.std().item()
-                
-                print(f"  Pixel difference (|im_q - im_k|): {pixel_diff:.6f}")
-                print(f"  im_q std: {pixel_std_q:.6f}, im_k std: {pixel_std_k:.6f}")
-                
-                if pixel_diff < 0.01:
-                    print(f"  ⚠️  CRITICAL: im_q and im_k are nearly identical! Check augmentations!")
-                elif pixel_diff < 0.05:
-                    print(f"  ⚠️  WARNING: im_q and im_k are very similar - augmentations may be too weak")
-                else:
-                    print(f"  ✓ Augmentations are producing different views")
+            if isinstance(first_batch, (tuple, list)):
+                if len(first_batch) == 2:
+                    # Standard 2-crop MoCo
+                    im_q_check = first_batch[0][:4].to(device)  # First 4 samples
+                    im_k_check = first_batch[1][:4].to(device)
+                    
+                    # Compute pixel-wise difference
+                    pixel_diff = (im_q_check - im_k_check).abs().mean().item()
+                    pixel_std_q = im_q_check.std().item()
+                    pixel_std_k = im_k_check.std().item()
+                    
+                    print(f"  Pixel difference (|im_q - im_k|): {pixel_diff:.6f}")
+                    print(f"  im_q std: {pixel_std_q:.6f}, im_k std: {pixel_std_k:.6f}")
+                    
+                    if pixel_diff < 0.01:
+                        print(f"  ⚠️  CRITICAL: im_q and im_k are nearly identical! Check augmentations!")
+                    elif pixel_diff < 0.05:
+                        print(f"  ⚠️  WARNING: im_q and im_k are very similar - augmentations may be too weak")
+                    else:
+                        print(f"  ✓ Augmentations are producing different views")
+                elif len(first_batch) == 4:
+                    # Multi-crop MoCo (2 global + 2 local)
+                    im_global1_check = first_batch[0][:4].to(device)
+                    im_global2_check = first_batch[1][:4].to(device)
+                    im_local1_check = first_batch[2][:4].to(device)
+                    im_local2_check = first_batch[3][:4].to(device)
+                    
+                    pixel_diff_g = (im_global1_check - im_global2_check).abs().mean().item()
+                    pixel_diff_l1 = (im_global1_check - im_local1_check).abs().mean().item()
+                    pixel_diff_l2 = (im_global1_check - im_local2_check).abs().mean().item()
+                    
+                    print(f"  Pixel difference (|global1 - global2|): {pixel_diff_g:.6f}")
+                    print(f"  Pixel difference (|global1 - local1|): {pixel_diff_l1:.6f}")
+                    print(f"  Pixel difference (|global1 - local2|): {pixel_diff_l2:.6f}")
+                    
+                    if pixel_diff_g < 0.01 or pixel_diff_l1 < 0.01 or pixel_diff_l2 < 0.01:
+                        print(f"  ⚠️  CRITICAL: Some crops are nearly identical! Check augmentations!")
+                    else:
+                        print(f"  ✓ Multi-crop augmentations are producing different views")
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Batch should be (view1, view2) tuple of tensors
-            # Custom collate function ensures this structure
-            if isinstance(batch, (tuple, list)) and len(batch) == 2:
-                im_q = batch[0].to(device, non_blocking=True)
-                im_k = batch[1].to(device, non_blocking=True)
+            # Batch can be either (view1, view2) for standard MoCo or (global1, global2, local1, local2) for multi-crop
+            if isinstance(batch, (tuple, list)):
+                if len(batch) == 2:
+                    # Standard 2-crop MoCo
+                    im_q = batch[0].to(device, non_blocking=True)
+                    im_k = batch[1].to(device, non_blocking=True)
+                    im_local1 = None
+                    im_local2 = None
+                elif len(batch) == 4:
+                    # Multi-crop MoCo (2 global + 2 local)
+                    im_q = batch[0].to(device, non_blocking=True)  # global1
+                    im_k = batch[1].to(device, non_blocking=True)  # global2
+                    im_local1 = batch[2].to(device, non_blocking=True)  # local1
+                    im_local2 = batch[3].to(device, non_blocking=True)  # local2
+                else:
+                    raise ValueError(f"Expected batch to be tuple/list of 2 or 4 views, got length {len(batch)}")
             else:
-                raise ValueError(f"Expected batch to be tuple/list of 2 views, got {type(batch)} with length {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+                raise ValueError(f"Expected batch to be tuple/list, got {type(batch)}")
             
             # Convert to channels_last if supported
             try:
                 im_q = im_q.to(memory_format=torch.channels_last)
                 im_k = im_k.to(memory_format=torch.channels_last)
+                if im_local1 is not None:
+                    im_local1 = im_local1.to(memory_format=torch.channels_last)
+                if im_local2 is not None:
+                    im_local2 = im_local2.to(memory_format=torch.channels_last)
             except:
                 pass
             
@@ -1633,12 +1707,12 @@ def train_moco(model, train_loader, num_epochs, device,
             if device.type == 'cuda':
                 if AUTOCAST_NEW_API:
                     with autocast(device_type='cuda', dtype=torch.bfloat16):
-                        loss = model.forward_moco(im_q, im_k)
+                        loss = model.forward_moco(im_q, im_k, im_local1, im_local2)
                 else:
                     with autocast():
-                        loss = model.forward_moco(im_q, im_k)
+                        loss = model.forward_moco(im_q, im_k, im_local1, im_local2)
             else:
-                loss = model.forward_moco(im_q, im_k)
+                loss = model.forward_moco(im_q, im_k, im_local1, im_local2)
             
             # Backward pass
             scaler.scale(loss).backward()

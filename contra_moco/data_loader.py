@@ -298,19 +298,24 @@ class CachedTensorDataset(Dataset):
         
         # Apply transform (should normalize + apply augmentations)
         if self.transform is not None:
-            if self.return_two_views:
-                # Check if transform already returns two views (e.g., MoCoTransform)
-                result = self.transform(img)
-                if isinstance(result, tuple) and len(result) == 2:
+            result = self.transform(img)
+            # Check if transform returns a tuple (2 or 4 crops)
+            if isinstance(result, tuple):
+                if len(result) == 2 or len(result) == 4:
                     return result
                 else:
-                    # Transform returns single view, apply twice for two views
-                    view1 = self.transform(img)
-                    view2 = self.transform(img)  # Apply transform again (stochastic)
-                    return view1, view2
+                    # Unexpected tuple length
+                    raise ValueError(f"Transform returned tuple with unexpected length: {len(result)}")
+            elif isinstance(result, list):
+                # Convert list to tuple for consistency
+                return tuple(result)
+            elif self.return_two_views:
+                # Transform returns single view, apply twice for two views
+                view1 = self.transform(img)
+                view2 = self.transform(img)  # Apply transform again (stochastic)
+                return view1, view2
             else:
-                img = self.transform(img)
-                return img
+                return result
         else:
             # No transform: return two views if requested, otherwise single view
             if self.return_two_views:
@@ -456,8 +461,8 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     Returns:
         DataLoader for pretraining
     """
-    from transforms import SimpleTransform, FastMultiCropTransform, MoCoTransform
-    from tensor_augmentations import TensorSimpleTransform, TensorMultiCropTransform
+    from transforms import SimpleTransform, FastMultiCropTransform, MoCoTransform, MoCoMultiCropTransform
+    from tensor_augmentations import TensorSimpleTransform, TensorMultiCropTransform, TensorMoCoMultiCropTransform
     
     # Check training mode and determine if we need two views
     training_mode = train_config.get('training_mode', 'kd')
@@ -508,14 +513,27 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         image_size = data_config.get('image_size', 96)
         use_multi_crop = train_config.get('use_multi_crop', False)
         
-        # For MoCo-v3, always use MoCo transform (works on tensors too)
+        # For MoCo-v3, use MoCo transform (works on tensors too)
         if training_mode == "moco_v3" or use_moco_aug:
-            # MoCoTransform works on PIL images, but we have tensors
-            # We'll use TensorSimpleTransform and apply it twice for two views
-            transform = TensorSimpleTransform(
-                image_size=image_size,
-                scale=(0.2, 1.0)
-            )
+            use_moco_multicrop = train_config.get('use_moco_multicrop', False)
+            if use_moco_multicrop:
+                # Use multi-crop MoCo transform (returns 4 crops)
+                transform = TensorMoCoMultiCropTransform(
+                    global_crops_scale=tuple(data_config.get('global_crops_scale', [0.2, 1.0])),
+                    local_crops_scale=tuple(data_config.get('local_crops_scale', [0.05, 0.4])),
+                    image_size=image_size
+                )
+                return_two_views = False  # Multi-crop returns tuple of 4, not 2
+                print("✓ Using MoCo-v3 multi-crop augmentations for cached tensors (2 global + 2 local crops)")
+            else:
+                # MoCoTransform works on PIL images, but we have tensors
+                # We'll use TensorSimpleTransform and apply it twice for two views
+                transform = TensorSimpleTransform(
+                    image_size=image_size,
+                    scale=(0.2, 1.0)
+                )
+                return_two_views = True
+                print("✓ Using MoCo-v3 style augmentations for cached tensors (two views per image)")
         elif use_multi_crop:
             transform = TensorMultiCropTransform(
                 global_crops_scale=tuple(data_config.get('global_crops_scale', [0.4, 1.0])),
@@ -573,10 +591,19 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
         use_multi_crop = train_config.get('use_multi_crop', False)
         use_local_crops = train_config.get('use_local_crops', False)
         
-        # For MoCo-v3, always use MoCo transform (returns two views)
+        # For MoCo-v3, use MoCo transform (returns two views) or multi-crop (returns 4 views)
         if training_mode == "moco_v3" or use_moco_aug:
-            transform = MoCoTransform(image_size=image_size)
-            print("✓ Using MoCo-v3 style augmentations (two views per image)")
+            use_moco_multicrop = train_config.get('use_moco_multicrop', False)
+            if use_moco_multicrop:
+                transform = MoCoMultiCropTransform(
+                    image_size=image_size,
+                    global_crops_scale=tuple(data_config.get('global_crops_scale', [0.2, 1.0])),
+                    local_crops_scale=tuple(data_config.get('local_crops_scale', [0.05, 0.4]))
+                )
+                print("✓ Using MoCo-v3 multi-crop augmentations (2 global + 2 local crops per image)")
+            else:
+                transform = MoCoTransform(image_size=image_size)
+                print("✓ Using MoCo-v3 style augmentations (two views per image)")
         elif use_multi_crop:
             transform = FastMultiCropTransform(
                 global_crops_scale=tuple(data_config.get('global_crops_scale', [0.4, 1.0])),
@@ -624,22 +651,39 @@ def build_pretraining_dataloader(data_config: dict, train_config: dict) -> torch
     # so we can disable shuffle for better sequential access within shards
     should_shuffle = not isinstance(dataset, RandomShardSubsetCachedDataset)
     
-    # Custom collate function for two-view batches
+    # Custom collate function for two-view or multi-crop batches
     def collate_two_views(batch):
-        """Collate function for batches that return (view1, view2) tuples"""
+        """Collate function for batches that return (view1, view2) tuples or (global1, global2, local1, local2) tuples"""
         if len(batch) == 0:
             return batch
         
-        # Check if first item is a tuple of two views
+        # Check if first item is a tuple
         first_item = batch[0]
-        if isinstance(first_item, tuple) and len(first_item) == 2:
-            # Batch is list of (view1, view2) tuples
-            # Collate into (batch_view1, batch_view2) tuple of tensors
-            view1_list = [item[0] for item in batch]
-            view2_list = [item[1] for item in batch]
-            view1_batch = torch.stack(view1_list)
-            view2_batch = torch.stack(view2_list)
-            return (view1_batch, view2_batch)
+        if isinstance(first_item, tuple):
+            if len(first_item) == 2:
+                # Batch is list of (view1, view2) tuples (standard MoCo)
+                # Collate into (batch_view1, batch_view2) tuple of tensors
+                view1_list = [item[0] for item in batch]
+                view2_list = [item[1] for item in batch]
+                view1_batch = torch.stack(view1_list)
+                view2_batch = torch.stack(view2_list)
+                return (view1_batch, view2_batch)
+            elif len(first_item) == 4:
+                # Batch is list of (global1, global2, local1, local2) tuples (multi-crop MoCo)
+                # Collate into (batch_global1, batch_global2, batch_local1, batch_local2) tuple of tensors
+                global1_list = [item[0] for item in batch]
+                global2_list = [item[1] for item in batch]
+                local1_list = [item[2] for item in batch]
+                local2_list = [item[3] for item in batch]
+                global1_batch = torch.stack(global1_list)
+                global2_batch = torch.stack(global2_list)
+                local1_batch = torch.stack(local1_list)
+                local2_batch = torch.stack(local2_list)
+                return (global1_batch, global2_batch, local1_batch, local2_batch)
+            else:
+                # Unexpected tuple length
+                print(f"⚠️ Warning: collate_two_views received tuple with unexpected length: {len(first_item)}")
+                return torch.utils.data.default_collate(batch)
         elif isinstance(first_item, torch.Tensor):
             # Single tensor - this shouldn't happen if return_two_views=True
             # But handle it gracefully by duplicating

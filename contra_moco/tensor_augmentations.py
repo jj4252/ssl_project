@@ -322,3 +322,115 @@ class TensorMultiCropTransform:
         
         return crops
 
+
+class TensorMoCoMultiCropTransform:
+    """
+    MoCo-v3 style multi-crop transform for cached tensors.
+    Returns 4 crops: 2 global + 2 local (as a tuple, matching MoCoMultiCropTransform).
+    """
+    def __init__(
+        self,
+        global_crops_scale: Tuple[float, float] = (0.2, 1.0),
+        local_crops_scale: Tuple[float, float] = (0.05, 0.4),
+        image_size: int = 96
+    ):
+        self.global_crops_scale = global_crops_scale
+        self.local_crops_scale = local_crops_scale
+        self.image_size = image_size
+        # ImageNet normalization stats
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
+    def _apply_global_transform(self, img: torch.Tensor) -> torch.Tensor:
+        """Apply global crop augmentation with MoCo-style strong augmentations"""
+        # Random resized crop
+        img = random_resized_crop_tensor(
+            img,
+            (self.image_size, self.image_size),
+            scale=self.global_crops_scale
+        )
+        
+        # Random horizontal flip
+        img = random_horizontal_flip(img)
+        
+        # Random color jitter (80% chance)
+        if random.random() < 0.8:
+            img = color_jitter_tensor(img, brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+        
+        # Random grayscale (20% chance)
+        img = random_grayscale_tensor(img, p=0.2)
+        
+        # Random Gaussian blur (50% chance)
+        if random.random() < 0.5:
+            img = gaussian_blur_tensor(img, kernel_size=9, sigma=(0.1, 2.0))
+        
+        # Random solarization (20% chance, only for global1)
+        # Note: We'll apply solarization in __call__ for global1 only
+        
+        # Normalize
+        if img.device != self.mean.device:
+            self.mean = self.mean.to(img.device)
+            self.std = self.std.to(img.device)
+        img = (img - self.mean) / self.std
+        
+        return img
+    
+    def _apply_local_transform(self, img: torch.Tensor) -> torch.Tensor:
+        """Apply local crop augmentation with lighter augmentations"""
+        # Random resized crop
+        img = random_resized_crop_tensor(
+            img,
+            (self.image_size, self.image_size),
+            scale=self.local_crops_scale
+        )
+        
+        # Random horizontal flip
+        img = random_horizontal_flip(img)
+        
+        # Random color jitter (80% chance)
+        if random.random() < 0.8:
+            img = color_jitter_tensor(img, brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+        
+        # Random grayscale (20% chance)
+        img = random_grayscale_tensor(img, p=0.2)
+        
+        # Random Gaussian blur (50% chance)
+        if random.random() < 0.5:
+            img = gaussian_blur_tensor(img, kernel_size=9, sigma=(0.1, 2.0))
+        
+        # Normalize
+        if img.device != self.mean.device:
+            self.mean = self.mean.to(img.device)
+            self.std = self.std.to(img.device)
+        img = (img - self.mean) / self.std
+        
+        return img
+    
+    def __call__(self, img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply multi-crop augmentations to cached tensor.
+        
+        Args:
+            img: Unnormalized tensor [C, H, W] from cache, range [0, 1]
+        
+        Returns:
+            Tuple of 4 augmented tensors: (global1, global2, local1, local2)
+        """
+        # Global crop 1 (with potential solarization)
+        global1 = self._apply_global_transform(img.clone())
+        # Apply solarization to global1 only (20% chance)
+        if random.random() < 0.2:
+            # Solarization: invert pixels above threshold
+            threshold = 0.5  # Normalized threshold (128/255)
+            mask = global1 > threshold
+            global1 = torch.where(mask, 1.0 - global1, global1)
+        
+        # Global crop 2 (no solarization)
+        global2 = self._apply_global_transform(img.clone())
+        
+        # Local crops
+        local1 = self._apply_local_transform(img.clone())
+        local2 = self._apply_local_transform(img.clone())
+        
+        return (global1, global2, local1, local2)
+

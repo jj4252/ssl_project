@@ -193,3 +193,84 @@ class MoCoTransform:
         view2 = self.transform2(image)
         return view1, view2
 
+
+class MoCoMultiCropTransform:
+    """
+    MoCo-v3 style augmentation with multi-crop support.
+    Returns 4 crops: 2 global crops + 2 local crops.
+    Global crops use strong augmentations, local crops use lighter augmentations.
+    """
+    def __init__(self, image_size=96, global_crops_scale=(0.2, 1.0), local_crops_scale=(0.05, 0.4)):
+        self.image_size = image_size
+        
+        # Global crop 1: Strong augmentations (query)
+        self.global_transform1 = transforms.Compose([
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=global_crops_scale,
+                interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))
+            ], p=0.5),
+            transforms.RandomApply([
+                transforms.RandomSolarize(threshold=128, p=1.0)
+            ], p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Global crop 2: Strong augmentations (key)
+        self.global_transform2 = transforms.Compose([
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=global_crops_scale,
+                interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))
+            ], p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Local crop transform: Lighter augmentations (no solarization, reduced color jitter)
+        self.local_transform = transforms.Compose([
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=local_crops_scale,
+                interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))
+            ], p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+    
+    def __call__(self, image):
+        # Return 4 crops: (global1, global2, local1, local2)
+        global1 = self.global_transform1(image)
+        global2 = self.global_transform2(image)
+        local1 = self.local_transform(image)
+        local2 = self.local_transform(image)
+        return (global1, global2, local1, local2)
+

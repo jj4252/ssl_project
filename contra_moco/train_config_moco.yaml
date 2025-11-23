@@ -25,6 +25,7 @@ moco:
 # Data augmentation (MoCo-v3 style)
 # Two views per image: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale
 use_moco_aug: true  # Use MoCo-v3 style augmentations
+use_moco_multicrop: true  # Use multi-crop MoCo (2 global + 2 local crops) instead of standard 2-crop
 
 # Optimization settings
 compile_student: true   # Compile encoder_q (never compile encoder_k)
