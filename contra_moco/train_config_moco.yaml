@@ -5,6 +5,8 @@
 training_mode: "moco_v3"
 
 # Training hyperparameters
+# NOTE: With use_moco_multicrop=true, reduce batch_size to avoid OOM (e.g., 128 or 64)
+# Multi-crop processes 4 crops per image (vs 2 for standard MoCo), effectively doubling memory usage
 batch_size: 256
 num_epochs: 800
 learning_rate: 0.0005  # Reduced from 0.001 to 0.0005 for stability (collapse happening too early)

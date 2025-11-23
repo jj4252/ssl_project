@@ -568,8 +568,12 @@ class MoCoModel(nn.Module):
         loss_global = self._compute_contrastive_loss(q, k, batch_size)
         losses.append(loss_global)
         
+        # Free memory: delete intermediate tensors for global crop
+        del q_features, q
+        
         # -----------------
-        # Local crops (if provided) - each contrasts against global key
+        # Local crops (if provided) - process sequentially to save memory
+        # Each local crop contrasts against the global key
         # -----------------
         if im_local1 is not None:
             assert im_local1.shape == im_q.shape, f"im_local1 shape mismatch: {im_local1.shape} vs {im_q.shape}"
@@ -579,6 +583,9 @@ class MoCoModel(nn.Module):
             
             loss_local1 = self._compute_contrastive_loss(q_local1, k, batch_size)
             losses.append(loss_local1)
+            
+            # Free memory: delete intermediate tensors (process sequentially to reduce peak memory)
+            del q_local1_features, q_local1
         
         if im_local2 is not None:
             assert im_local2.shape == im_q.shape, f"im_local2 shape mismatch: {im_local2.shape} vs {im_q.shape}"
@@ -588,6 +595,9 @@ class MoCoModel(nn.Module):
             
             loss_local2 = self._compute_contrastive_loss(q_local2, k, batch_size)
             losses.append(loss_local2)
+            
+            # Free memory: delete intermediate tensors
+            del q_local2_features, q_local2
         
         # Average all losses
         total_loss = sum(losses) / len(losses)
